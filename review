@@ -1,0 +1,879 @@
+#!/usr/bin/env python
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+"""
+Wrapper around Phabricator's `arc` cli to support submission of a series of commits.
+
+Goals:
+- must only use standard libraries
+- must be a single file for easy deployment
+- should work on python 2.7 and python 3.5+
+
+Configuration:
+`review` is configured via the following environmental variables:
+NO_ANSI : disable ANSI output (default: auto-detected)
+IS_DEV  : connect to phabricator dev instance (default: connect to production)
+DEBUG   : enabled debugging output (default: disabled)
+"""
+
+import re
+import os
+import sys
+import argparse
+import subprocess
+import logging
+import tempfile
+import termios
+import tty
+import ConfigParser
+
+# TODO unit tests
+# TODO unicode testing
+# TODO python3
+# TODO windows
+
+# Environment Vars
+
+DEBUG = bool(os.getenv("DEBUG"))
+IS_DEV = bool(os.getenv("IS_DEV"))
+HAS_ANSI = (
+    (hasattr(sys.stdout, "isatty") and sys.stdout.isatty())
+    or os.getenv("TERM", "") == "ANSI"
+    or os.getenv("PYCHARM_HOSTED", "") == "1"
+) and not os.getenv("NO_ANSI")
+
+# Constants and Globals
+
+logger = logging.getLogger("review")
+config = None
+
+# Where to direct people when `arc` isn't installed.
+GUIDE_URL = (
+    "http://moz-conduit.readthedocs.io/en/latest/phabricator-user.html#quick-start"
+)
+
+# URL to post to.
+PHABIRCATOR_URL = (
+    "https://phabricator-dev.allizom.org/"
+    if IS_DEV
+    else "https://phabricator.services.mozilla.com/"
+)
+
+# arc related consts.
+ARC = ["arc"]
+ARC_COMMIT_DESC_TEMPLATE = """
+{summary}
+
+Summary:
+{body}
+
+Test Plan:
+
+{depends_on}
+
+Reviewers: {reviewers}
+
+Subscribers:
+
+Bug #: {bug_id}
+""".strip()
+ARC_REV_URL_RE = re.compile(r"^\s*Revision URI: (http.+)$", flags=re.MULTILINE)
+ARC_DIFF_REV_RE = re.compile(
+    r"^\s*Differential Revision:\s*https://.+/D(\d+)$", flags=re.MULTILINE
+)
+
+# Bug and review regexs (from vct's commitparser)
+BUG_ID_RE = re.compile(r"(?:(?:bug|b=)(?:\s*)(\d+)(?=\b))", flags=re.IGNORECASE)
+LIST = r"[;,\/\\]\s*"
+LIST_RE = re.compile(LIST)
+IRC_NICK = r"[a-zA-Z0-9\-\_]+"
+REVIEWERS_RE = re.compile(
+    r"([\s(.\[;,])(r[=?])("
+    + IRC_NICK
+    + r"(?:"
+    + LIST
+    + r"(?![a-z0-9.\-]+[=?])"
+    + IRC_NICK
+    + r")*)?"
+)
+R_SPECIFIER_RE = re.compile(r"\br[=?]")
+
+# Does this string look like a revision hash/number?
+REV_RS = re.compile("^(?:[0-9a-f]{7,12,40}|\d+)$").search
+
+
+#
+# Utilities
+#
+
+
+def which(filename):
+    # backport of shutil.which from py3
+    seen = set()
+    for path in os.environ.get("PATH", os.defpath).split(os.pathsep):
+        norm_path = os.path.normcase(path)
+        if norm_path not in seen:
+            seen.add(norm_path)
+            fn = os.path.join(path, filename)
+            if (
+                os.path.exists(fn)
+                and os.access(fn, os.F_OK | os.X_OK)
+                and not os.path.isdir(fn)
+            ):
+                return fn
+    return None
+
+
+def shell_quote(s):
+    # backport of shutil.quote from py3
+    _find_unsafe = re.compile(r"[^\w@%+=:,./-]").search
+    if not s:
+        return "''"
+    if _find_unsafe(s) is None:
+        return s
+    return "'" + s.replace("'", "'\"'\"'").replace("\n", "\\n") + "'"
+
+
+def check_call(command, *args):
+    # wrapper around subprocess.check_call with debug output
+    logger.debug("$ %s" % " ".join(shell_quote(s) for s in command))
+    subprocess.check_call(command, *args)
+
+
+def check_output(command, split=True):
+    # wrapper around subprocess.check_output with debug output and splitting
+    logger.debug("$ %s" % " ".join(shell_quote(s) for s in command))
+    try:
+        output = subprocess.check_output(command).rstrip()
+    except subprocess.CalledProcessError as e:
+        logger.debug(e.output)
+        raise Exception("command '%s' failed to complete successfully" % command[0])
+    if output:
+        logger.debug(output)
+    return output.splitlines() if split else output
+
+
+def is_revision(revs):
+    # do all elements in the revs list look like revisions?
+    if not revs:
+        return False
+    return all(REV_RS(r) for r in revs)
+
+
+def prompt(question, options):
+    if HAS_ANSI:
+        question = "\033[33m%s\033[0m" % question
+    options[0] = options[0].upper()
+    sys.stdout.write("%s (%s)? " % (question, "/".join(options)))
+    sys.stdout.flush()
+
+    res = ""
+    old_term_attrs = None
+    fd = sys.stdout.fileno()
+    default = options[0][0].lower()
+    options = {o[0].lower(): o for o in options}
+    try:
+        old_term_attrs = termios.tcgetattr(fd)
+        try:
+            tty.setraw(sys.stdin.fileno())
+        except termios.error:
+            pass
+        while res not in options:
+            res = sys.stdin.read(1).lower()
+            if res == chr(13):
+                res = default
+            elif res == chr(3) or res == chr(27):
+                sys.exit(1)
+    except termios.error:
+        while res not in options:
+            res = sys.stdin.readline().strip().lower()
+            if len(res) > 1:
+                res = res[0]
+    finally:
+        if old_term_attrs:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_term_attrs)
+            if res in options:
+                print(options[res])
+            else:
+                print("^C")
+
+    return options[res]
+
+
+class ReviewError(Exception):
+    """Errors throw explictly by this script, result in slightly different output."""
+
+
+#
+# Configuration
+#
+
+
+class Config(object):
+    def __init__(self):
+        self._filename = os.path.join(os.path.expanduser("~"), ".review-config")
+        self._config = ConfigParser.ConfigParser()
+        self._config.read([self._filename])
+
+        self.auto_submit = self._get_boolean("submit", "auto_submit", False)
+        self.always_blocking = self._get_boolean("submit", "always_blocking", False)
+
+        if not os.path.exists(self._filename):
+            self.write()
+
+    def _get_boolean(self, section, option, default):
+        try:
+            value = self._config.getboolean(section, option)
+            logger.debug("read config %s.%s: %s" % (section, option, value))
+            return value
+        except (ValueError, ConfigParser.NoSectionError, ConfigParser.NoOptionError):
+            logger.debug("using default config %s.%s: %s" % (section, option, default))
+            return default
+
+    def write(self):
+        if os.path.exists(self._filename):
+            logger.info("updating %s" % self._filename)
+        else:
+            logger.info("creating %s" % self._filename)
+
+        if not self._config.has_section("submit"):
+            self._config.add_section("submit")
+        self._config.set("submit", "auto_submit", self.auto_submit)
+        self._config.set("submit", "always_blocking", self.always_blocking)
+
+        with open(self._filename, "w") as f:
+            self._config.write(f)
+
+
+#
+# Repository
+#
+
+
+def find_repo_root():
+    """Walk parents to find repository root."""
+    while os.getcwd() != "/":
+        if os.path.exists(".hg") or os.path.exists(".git"):
+            return os.path.abspath(os.getcwd())
+        os.chdir("..")
+    else:
+        raise ReviewError(
+            "Not a repository (or any of the parent directories): .hg / .git"
+        )
+
+
+def repo_from_root(path):
+    try:
+        return Mercurial(path)
+    except ValueError:
+        pass
+    try:
+        return Git(path)
+    except ValueError:
+        pass
+    raise ReviewError("Failed to find Repository class for %s" % path)
+
+
+class Repository(object):
+    def __init__(self, path):
+        self.path = path
+        self.args = None
+
+    def set_args(self, args):
+        self.args = args
+
+    def add_submit_arguments(self, parser):
+        """Add vcs-specific args to the `submit` command."""
+
+    def commit_stack(self):
+        """Return list of { node, summary, body }."""
+
+    def preview_commit_stack(self, commits):
+        """Log the commit stack in a human readable form."""
+
+    def refresh_commit_stack(self, commits):
+        """Update the stack following an altering change (eg rebase)."""
+
+    def checkout(self, node):
+        """Checkout/Update to specified node."""
+
+    def amend_commit(self, commit):
+        """Amend commit description from `desc` field; return bool indicating if update was required."""
+
+    def rebase_commit(self, source_commit, dest_commit):
+        """Rebase."""
+
+    def check_commits_for_submit(self, commits):
+        """Validate the list of commits (from commit_stack) are ok to submit"""
+
+        errors = []
+
+        for commit in commits:
+            commit_errors = []
+            if not self.args.bug and not commit["bug-id"]:
+                commit_errors.append("missing bug-id")
+            if not self.args.reviewer and not commit["reviewers"]:
+                commit_errors.append("missing reviewers")
+            if self.args.bug and commit["bug-id"] and self.args.bug != commit["bug-id"]:
+                commit_errors.append(
+                    "bug-id mismatch between command line (bug %s) and commit (bug %s)"
+                    % (self.args.bug, commit["bug-id"])
+                )
+            if commit_errors:
+                errors.append(
+                    "%s %s\n- %s"
+                    % (commit["name"], commit["summary"], "\n- ".join(commit_errors))
+                )
+
+        if errors:
+            raise ReviewError("Unable to submit commits:\n\n%s" % "\n\n".join(errors))
+
+
+#
+# Mercurial
+#
+
+
+class Mercurial(Repository):
+    def __init__(self, path):
+        super(Mercurial, self).__init__(path)
+
+        if not os.path.exists(os.path.join(path, ".hg")):
+            raise ValueError("%s: not a hg repository" % path)
+        if not which("hg"):
+            raise ReviewError("Failed to find 'hg' executable")
+
+        logger.debug("found hg repo in %s" % path)
+
+        self.hg = ["hg"]
+        self.revset = None
+
+        hg_config = {}
+        for line in check_output(self.hg + ["config"]):
+            (name, value) = line.split("=", 1)
+            hg_config[name] = value
+
+        if "ui.username" not in hg_config:
+            raise ReviewError("ui.username is not configured in your hgrc")
+
+        # Need to use the correct username.
+        self.hg.extend(["--config", "ui.username=%s" % hg_config["ui.username"]])
+
+        # Always need rebase.
+        self.hg.extend(["--config", "extensions.rebase="])
+
+        # TODO test without evolve
+        # experimental.evolution.createmarkers=true
+        # do the work, then delete the obs file
+
+        # Enable evolve if the user's currently using it.
+        if "extensions.evolve" in hg_config:
+            self.hg.extend(["--config", "extensions.evolve="])
+
+        # Shorter graphs are nicer
+        self.hg.extend(["--config", "experimental.graphshorten=true"])
+
+        # Disable the user's hgrc file, to ensure we run without rogue extensions.
+        os.environ["HGRCPATH"] = ""
+
+    def _hg_log(self, revset, split=True, select="node"):
+        return check_output(
+            self.hg + ["log", "-T", "{%s}\n" % select, "-r", revset], split=split
+        )
+
+    def refresh_commit_stack(self, commits):
+        """Update all commits to point to their superseded commit."""
+        for commit in commits:
+            hg_log = check_output(
+                self.hg
+                + ["log"]
+                + ["-T", "{rev} {node}\n"]
+                + ["--hidden"]
+                + ["-r", "successors(%s)" % commit["node"]],
+                split=False,
+            )
+            if hg_log:
+                (rev, node) = hg_log.split(" ", 1)
+                commit["node"] = node
+                commit["name"] = "%s:%s" % (rev, node[:12])
+
+        augment_commits_from_body(commits)
+
+    def add_submit_arguments(self, parser):
+        parser.add_argument(
+            "range", nargs="?", default="(auto)", help="Start and end commits to submit"
+        )
+
+    def set_args(self, args):
+        super(Mercurial, self).set_args(args)
+
+        if self.args.range == "(auto)":
+            # resolve to revision numbers as that's nicer to read
+            try:
+                start = self._hg_log(
+                    "children(last(public())) and (not obsolete())", select="rev"
+                )[0]
+            except IndexError:
+                raise ReviewError("Failed to find draft commits to submit")
+            end = self._hg_log(".", select="rev")[0]
+
+        else:
+            # range of commits, supports either a revision num or sha
+            range_arg = re.sub(r"[: -]", ":", args.range)
+            if ":" in range_arg:
+                (start, end) = range_arg.split(":", 1)
+            else:
+                (start, end) = (range_arg, range_arg)
+            if not is_revision([start, end]):
+                raise ValueError(
+                    "Invalid revision range; use <start_rev>-<end_rev>.  eg. 45-48"
+                )
+
+        self.revset = "%s::%s" % (start, end)
+
+    def commit_stack(self):
+        hg_log = check_output(
+            self.hg
+            + ["log", "-T", "{rev} {node} {desc|firstline}\n", "-r", self.revset]
+        )
+
+        commits = []
+        for log_line in hg_log:
+            (rev, node, summary) = log_line.split(" ", 2)
+            commits.append(
+                dict(name="%s:%s" % (rev, node[:12]), node=node, summary=summary)
+            )
+            body = check_output(self.hg + ["log", "-T", "{desc}", "-r", node])
+            commits[-1]["body"] = "\n".join(body[1:]).rstrip()
+
+        return commits
+
+    def preview_commit_stack(self, commits):
+        commit_dict = dict(map(lambda co: (co["node"], co), commits))
+        log_output = check_output(
+            self.hg
+            + ["log", "-G"]
+            + ["-T", "{node}\n"]
+            + ["-r", "|".join([c["node"] for c in commits])]
+        )
+        log_rev_re = re.compile(r" ([a-f0-9]{40})$")
+        for log_line in log_output:
+            # Replace the commit's node with the full-formed summary
+            m = log_rev_re.search(log_line)
+            if m:
+                rev = m.group(1)
+                log_line = log_line.replace(rev, commit_dict[rev]["summary"])
+            logger.info(log_line)
+
+    def checkout(self, node):
+        check_call(self.hg + ["update", "-q", node])
+
+    def amend_commit(self, commit):
+        current_body = "%s\n%s" % (commit["summary"], commit["body"])
+        repo_body = check_output(
+            self.hg + ["log", "-T", "{desc}", "-r", commit["node"]], split=False
+        )
+        if repo_body == current_body:
+            logger.debug("not amending commit %s, unchanged" % commit["name"])
+            return
+
+        with tempfile.NamedTemporaryFile() as temp_f:
+            temp_f.write(current_body)
+            temp_f.flush()
+
+            self.checkout(commit["node"])
+            check_call(self.hg + ["commit", "--amend", "-l", temp_f.name])
+
+    def rebase_commit(self, source_commit, dest_commit):
+        check_call(
+            self.hg + ["rebase", "-s", source_commit["node"], "-d", dest_commit["node"]]
+        )
+
+    def check_commits_for_submit(self, commits):
+        nodes = [c["node"] for c in commits]
+
+        # TODO provide an override switch, to skip the potentially expensive or incorrect checks
+
+        # Merge base should be included in the revset
+        ancestor = self._hg_log("ancestor(%s)" % self.revset, split=False)
+        if ancestor not in nodes:
+            raise ReviewError(
+                "Non-linear commit stack (common ancestor %s missing from stack)"
+                % ancestor[:12]
+            )
+
+        # Merge base needs to have a public parent
+        parent_phases = check_output(
+            self.hg + ["log", "-T", "{phase} {node}\n", "-r", "parents(%s)" % ancestor]
+        )
+        for parent in parent_phases:
+            (phase, node) = parent.split(" ", 1)
+            if phase != "public":
+                raise ReviewError(
+                    "%s is based off non-public commit %s" % (ancestor[:12], node[:12])
+                )
+
+        for commit in commits:
+            # Can't submit merge requests
+            parents = self._hg_log("parents(%s)" % commit["node"])
+            if len(parents) > 1:
+                raise ReviewError("%s is a merge commit" % commit["node"][:12])
+
+            # Follow each branch on the DAG ensuring only one has our nodes
+            children = self._hg_log("children(%s)" % commit["node"])
+            found = False
+            for child in children:
+                descendants = self._hg_log(
+                    "descendants(%s) and %s" % (child, self.revset)
+                )
+                if len(descendants):
+                    if found:
+                        raise ReviewError("Non-linear commit stack")
+                    found = True
+
+        super(Mercurial, self).check_commits_for_submit(commits)
+
+
+#
+# Git
+#
+
+
+class Git(Repository):
+    def __init__(self, path):
+        super(Git, self).__init__(path)
+
+        if not os.path.exists(os.path.join(path, ".git")):
+            raise ValueError("%s: not a git repository" % path)
+        if not which("git"):
+            raise ReviewError("Failed to find 'git' executable")
+        # TODO cinnabar check
+        # TODO draw the rest of the owl
+
+        logger.debug("found git repo in %s" % path)
+
+
+#
+# Commit helpers
+#
+
+
+def augment_commits_from_body(commits):
+    """Extract metadata from commit body as fields.
+    Adds: diff-id, bug-id, reviewers
+    """
+
+    for commit in commits:
+        m = ARC_DIFF_REV_RE.search(commit["body"])
+        commit["diff-id"] = m.group(1) if m else None
+
+        # bug-id
+        bug_ids = BUG_ID_RE.findall(commit["summary"])
+        if bug_ids:
+            if len(bug_ids) > 1:
+                logger.warning("Multiple bug-IDs found, using %s" % bug_ids[0])
+            commit["bug-id"] = bug_ids[0]
+        else:
+            commit["bug-id"] = None
+
+        # reviewers
+        reviewers = []
+        for match in re.finditer(REVIEWERS_RE, commit["summary"]):
+            if not match.group(3):
+                continue
+            reviewers.extend(re.split(LIST_RE, match.group(3)))
+        commit["reviewers"] = reviewers
+
+        commit["summary"] = replace_reviewers(commit["summary"], [])
+
+
+def replace_reviewers(commit_description, reviewers):
+    """From vct's commitparser"""
+    if not reviewers:
+        reviewers_str = ""
+    else:
+        reviewers_str = "r=" + ",".join(reviewers)
+
+    if commit_description == "":
+        return reviewers_str
+
+    commit_description = commit_description.splitlines()
+    commit_summary = commit_description.pop(0)
+    commit_description = "\n".join(commit_description)
+
+    if not R_SPECIFIER_RE.search(commit_summary):
+        commit_summary += " " + reviewers_str
+    else:
+        # replace the first r? with the reviewer list, and all subsequent
+        # occurrences with a marker to mark the blocks we need to remove
+        # later
+        d = {"first": True}
+
+        def replace_first_reviewer(matchobj):
+            if R_SPECIFIER_RE.match(matchobj.group(2)):
+                if d["first"]:
+                    d["first"] = False
+                    return matchobj.group(1) + reviewers_str
+                else:
+                    return "\0"
+            else:
+                return matchobj.group(0)
+
+        commit_summary = re.sub(REVIEWERS_RE, replace_first_reviewer, commit_summary)
+
+        # remove marker values as well as leading separators.  this allows us
+        # to remove runs of multiple reviewers and retain the trailing
+        # separator.
+        commit_summary = re.sub(LIST + "\0", "", commit_summary)
+        commit_summary = re.sub("\0", "", commit_summary)
+
+    if commit_description == "":
+        return commit_summary.strip()
+    else:
+        return commit_summary.strip() + "\n" + commit_description
+
+
+#
+# "submit" Command
+#
+
+
+def update_commits_from_args(commits, args):
+
+    # Process reviewers and blockers from args
+    if args.reviewer:
+        reviewers = dict(
+            (nick.lower(), config.always_blocking) for nick in args.reviewer
+        )
+    else:
+        reviewers = {}
+    if args.blocker:
+        for reviewer in args.blocker:
+            reviewers[reviewer.lower()] = True
+    args.reviewer = map(
+        lambda nick: "%s%s" % (nick[0], "!" if nick[1] else ""), reviewers.items()
+    )
+
+    # Command args always overwrite commit desc.
+    if args.reviewer:
+        for commit in commits:
+            commit["reviewers"] = args.reviewer
+
+    # Mark reviewers as blocking when told to always do so.
+    if config.always_blocking:
+        for commit in commits:
+            commit["reviewers"] = [
+                "%s!" % nick.rstrip("!") for nick in commit["reviewers"]
+            ]
+
+    # Update commit summaries.
+    for commit in commits:
+        # Reviewers.
+        summary = replace_reviewers(commit["summary"], commit["reviewers"])
+
+        # Bug-ID.
+        if not BUG_ID_RE.search(summary) and not commit["bug-id"] and args.bug:
+            summary = "Bug %s - %s" % (args.bug, summary)
+
+        commit["summary"] = summary
+
+
+def submit(repo, args):
+    # Find and preview commits to submit
+    commits = repo.commit_stack()
+    if not commits:
+        raise ReviewError("Failed to find any commits to submit")
+    logger.warning(
+        "Submitting %s commit%s:" % (len(commits), "" if len(commits) == 1 else "s")
+    )
+
+    # Pre-Process to load metadata
+    augment_commits_from_body(commits)
+    update_commits_from_args(commits, args)
+
+    # Validate commit stack is suitable for review
+    repo.preview_commit_stack(commits)
+    repo.check_commits_for_submit(commits)
+
+    if not config.auto_submit:
+        res = prompt("Submit to Phabricator", ["Yes", "No", "Always"])
+        if res == "No":
+            return
+        if res == "Always":
+            config.auto_submit = True
+            config.write()
+
+    # Process
+    previous_commit = None
+    rebase_onto = None
+    for commit in commits:
+        if rebase_onto:
+            repo.rebase_commit(commit, rebase_onto)
+            repo.refresh_commit_stack(commits)
+            rebase_onto = None
+
+        if commit["diff-id"]:
+            logger.warning("Updating revision D%s:" % commit["diff-id"])
+        else:
+            logger.warning("Creating new revision:")
+        logger.warning("%s %s" % (commit["name"], commit["summary"]))
+        repo.checkout(commit["node"])
+
+        # Create arc-annotated commit description
+        template_vars = dict(
+            summary=commit["summary"],
+            body=commit["body"],
+            reviewers=", ".join(
+                commit["reviewers"] if commit["reviewers"] else args.reviewer
+            ),
+            bug_id=commit["bug-id"] if commit["bug-id"] else args.bug,
+            depends_on="",
+        )
+        if previous_commit:
+            template_vars["depends_on"] = "Depends on D%s" % previous_commit["diff-id"]
+        arc_commit_desc = ARC_COMMIT_DESC_TEMPLATE.format(**template_vars)
+        logger.debug("--- arc message\n%s\n---" % arc_commit_desc)
+
+        # Run arc
+        with tempfile.NamedTemporaryFile() as temp_f:
+            temp_f.write(arc_commit_desc)
+            temp_f.flush()
+
+            arc_command = (
+                ARC
+                + ["diff"]
+                + ["--allow-untracked", "--no-amend", "--no-ansi"]
+                + ["--message-file", temp_f.name]
+            )
+
+            if commit["diff-id"]:
+                arc_command.extend(
+                    ["--message", "Revision updated."] + ["--update", commit["diff-id"]]
+                )
+            else:
+                arc_command.append("--create")
+
+            arc_output = check_output(arc_command, split=False)
+            if logger.level != logging.DEBUG:
+                logger.info(arc_output)
+
+        # Extract Revision URL
+        m = ARC_REV_URL_RE.search(arc_output)
+        if not m:
+            raise ReviewError("Failed to find 'Revision URL' in arc output")
+        revision_url = m.group(1)
+
+        # Append/replace div rev url to/in commit description
+        body = commit["body"]
+        body = ARC_DIFF_REV_RE.sub("", body).rstrip()
+        if body:
+            body += "\n\n"
+        body += "Differential Revision: %s" % revision_url
+
+        if commit["body"] != body:
+            commit["body"] = body
+            repo.amend_commit(commit)
+            repo.refresh_commit_stack(commits)
+            rebase_onto = commit
+
+        previous_commit = commit
+
+
+#
+# Main
+#
+
+
+def colour_logger(logger_method, colour_code):
+    def wrapper(message, *args, **kwargs):
+        return logger_method(
+            "\033[%sm%s\033[0m" % (colour_code, message), *args, **kwargs
+        )
+
+    return wrapper
+
+
+def init_logging():
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    if HAS_ANSI:
+        setattr(logger, "warning", colour_logger(getattr(logger, "warning"), "34"))
+        setattr(logger, "error", colour_logger(getattr(logger, "error"), "31"))
+    stdout_handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(stdout_handler)
+    logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
+    if not DEBUG:
+        sys.tracebacklimit = 0
+
+
+def parse_args(repo):
+    parser = argparse.ArgumentParser()
+    commands = parser.add_subparsers(dest="command")
+    commands.required = True
+
+    submit_parser = commands.add_parser(
+        "submit", help="Submit commits(s) to Phabricator"
+    )
+    submit_parser.add_argument("--bug", "-b", help="Set Bug ID for all commits")
+    submit_parser.add_argument(
+        "--reviewer",
+        "--reviewers",
+        "-r",
+        action="append",
+        help="Set review(s) for all commits",
+    )
+    submit_parser.add_argument(
+        "--blocker",
+        "--blocker",
+        "-R",
+        action="append",
+        help="Set blocking review(s) for all commits",
+    )
+    # arc informs users to pass --trace for more output, so we need to accept it
+    submit_parser.add_argument("--trace", action="store_true", help=argparse.SUPPRESS)
+    repo.add_submit_arguments(submit_parser)
+    submit_parser.set_defaults(func=submit)
+
+    return parser.parse_args()
+
+
+def main():
+    global config
+    try:
+        init_logging()
+        config = Config()
+
+        if not which("arc"):
+            raise ReviewError(
+                "Failed to find 'arc' on the system path.\n"
+                "Please follow the Phabricator setup guide:\n"
+                "%s" % GUIDE_URL
+            )
+
+        repo = repo_from_root(find_repo_root())
+        args = parse_args(repo)
+
+        if DEBUG or (hasattr(args, "trace") and args.trace):
+            ARC.append("--trace")
+
+        repo.set_args(args)
+        args.func(repo, args)
+    except KeyboardInterrupt:
+        pass
+    except ReviewError as e:
+        if DEBUG:
+            raise
+        logger.error(e)
+    except Exception as e:
+        if DEBUG:
+            raise
+        logger.error("%s: %s" % (e.__class__.__name__, e))
+
+
+# TODO check reordering
+# TODO reordering and dep cycles
+
+
+if __name__ == "__main__":
+    main()
