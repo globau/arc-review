@@ -36,6 +36,7 @@ submit.always_blocking: when true reviewers in commit descriptions will be marke
 
 import ConfigParser
 import argparse
+import errno
 import logging
 import os
 import re
@@ -168,7 +169,7 @@ def check_call(command, *args):
     subprocess.check_call(command, *args)
 
 
-def check_output(command, split=True):
+def check_output(command, split=True, never_log=False):
     # wrapper around subprocess.check_output with debug output and splitting
     logger.debug("$ %s" % " ".join(shell_quote(s) for s in command))
     try:
@@ -176,7 +177,7 @@ def check_output(command, split=True):
     except subprocess.CalledProcessError as e:
         logger.debug(e.output)
         raise Exception("command '%s' failed to complete successfully" % command[0])
-    if output:
+    if output and not never_log:
         logger.debug(output)
     return output.splitlines() if split else output
 
@@ -222,7 +223,7 @@ def prompt(question, options):
 
 
 class ReviewError(Exception):
-    """Errors throw explictly by this script, result in slightly different output."""
+    """Errors throw explictly by this script; won't generate a stack trace."""
 
 
 #
@@ -312,6 +313,9 @@ class Repository(object):
         self.path = path
         self.args = None
 
+    def cleanup(self):
+        """Perform any repo-related cleanup tasks."""
+
     def set_args(self, args):
         self.args = args
 
@@ -344,6 +348,7 @@ class Repository(object):
         for commit in commits:
             commit_errors = []
             # TODO treat bug-id the same as reviewers; update from args, validate if missing, no need for cross-check
+            # TODO allow NOBUG in commit message only
             if not self.args.bug and not commit["bug-id"]:
                 commit_errors.append("missing bug-id")
             if self.args.bug and commit["bug-id"] and self.args.bug != commit["bug-id"]:
@@ -386,11 +391,15 @@ class Mercurial(Repository):
 
         self.hg = ["hg"]
         self.revset = None
+        self.strip_nodes = []
 
         hg_config = {}
-        for line in check_output(self.hg + ["config"]):
+        for line in check_output(self.hg + ["config"], never_log=True):
             (name, value) = line.split("=", 1)
-            hg_config[name] = value
+            name = name.strip()
+            value = value.strip()
+            if not name.startswith("extensions.") or not value.startswith("!"):
+                hg_config[name] = value
 
         # Need to use the correct username.
         if "ui.username" not in hg_config:
@@ -400,19 +409,33 @@ class Mercurial(Repository):
         # Always need rebase.
         self.hg.extend(["--config", "extensions.rebase="])
 
-        # TODO test without evolve
-        # experimental.evolution.createmarkers=true
-        # do the work, then delete the obs file
-
         # Enable evolve if the user's currently using it.
         if "extensions.evolve" in hg_config:
             self.hg.extend(["--config", "extensions.evolve="])
+            self.use_evolve = True
+
+        # Otherwise just enable obsolescence markers, and remove the obsstore when we're done.
+        else:
+            self.hg.extend(["--config", "experimental.evolution.createmarkers=true"])
+            self.hg.extend(["--config", "extensions.strip="])
+            self.use_evolve = False
 
         # Shorter graphs are nicer
         self.hg.extend(["--config", "experimental.graphshorten=true"])
 
         # Disable the user's hgrc file, to ensure we run without rogue extensions.
         os.environ["HGRCPATH"] = ""
+
+    def cleanup(self):
+        if not self.use_evolve:
+            try:
+                os.unlink(os.path.join(self.path, ".hg", "store", "obsstore"))
+            except OSError as e:
+                if e.errno != errno.ENOENT:
+                    raise
+
+        for node in self.strip_nodes:
+            check_call(self.hg + ["strip", "--no-backup", node])
 
     def _hg_log(self, revset, split=True, select="node"):
         return check_output(
@@ -427,9 +450,10 @@ class Mercurial(Repository):
                 + ["log"]
                 + ["-T", "{rev} {node}\n"]
                 + ["--hidden"]
-                + ["-r", "successors(%s)" % commit["node"]],
+                + ["-r", "successors(%s) and not obsolete()" % commit["node"]],
                 split=False,
             )
+            # TODO what if there's more than one?
             if hg_log:
                 (rev, node) = hg_log.split(" ", 1)
                 commit["node"] = node
@@ -454,19 +478,24 @@ class Mercurial(Repository):
         super(Mercurial, self).set_args(args)
 
         if self.args.start_rev == "(auto)":
-            self.args.start_rev = "children(last(public())) and (not obsolete())"
+            start = "ancestors(.) and not public() and not obsolete()"
+        else:
+            start = self.args.start_rev
 
         # resolve to nodes as that's nicer to read
         try:
-            start = self._hg_log(self.args.start_rev)[0]
+            start = self._hg_log(start)[0]
         except IndexError:
-            raise ReviewError(
-                "Failed to start of commit range: %s" % self.args.start_rev
-            )
+            if self.args.start_rev == "(auto)":
+                raise ReviewError("Failed to find draft commits to submit")
+            else:
+                raise ReviewError(
+                    "Failed to start of commit range: %s" % self.args.start_rev
+                )
         try:
             end = self._hg_log(self.args.end_rev)[0]
         except IndexError:
-            raise ReviewError("Failed to end of commit rnage: %s" % self.args.end_rev)
+            raise ReviewError("Failed to end of commit range: %s" % self.args.end_rev)
 
         self.revset = "%s::%s" % (start[:12], end[:12])
 
@@ -483,10 +512,7 @@ class Mercurial(Repository):
                 dict(name="%s:%s" % (rev, node[:12]), node=node, summary=summary)
             )
             body = check_output(self.hg + ["log", "-T", "{desc}", "-r", node])
-            if body:
-                commits[-1]["body"] = ""
-            else:
-                commits[-1]["body"] = "\n".join(body[1:]).rstrip()
+            commits[-1]["body"] = "\n".join(body[1:]).rstrip()
 
         return commits
 
@@ -525,6 +551,11 @@ class Mercurial(Repository):
 
             self.checkout(commit["node"])
             check_call(self.hg + ["commit", "--amend", "--logfile", temp_f.name])
+
+        # If we don't have evolve we need to strip the commit, otherwise it will
+        # "reappear" when we remove the obsstore.
+        if not self.use_evolve:
+            self.strip_nodes.append(commit["node"])
 
     def rebase_commit(self, source_commit, dest_commit):
         check_call(
@@ -732,7 +763,10 @@ def submit(repo, args):
     repo.check_commits_for_submit(commits)
 
     if not config.auto_submit:
-        res = prompt("Submit to Phabricator", ["Yes", "No", "Always"])
+        res = prompt(
+            "Submit to Phabricator%s" % "-dev" if IS_DEV else "",
+            ["Yes", "No", "Always"],
+        )
         if res == "No":
             return
         if res == "Always":
@@ -801,8 +835,8 @@ def submit(repo, args):
         body = commit["body"]
         body = ARC_DIFF_REV_RE.sub("", body).rstrip()
         if body:
-            body += "\n\n"
-        body += "Differential Revision: %s" % revision_url
+            body += "\n"
+        body += "\nDifferential Revision: %s" % revision_url
 
         if commit["body"] != body:
             commit["body"] = body
@@ -884,18 +918,19 @@ def main():
             )
 
         repo = repo_from_root(find_repo_root())
-        args = parse_args(repo)
+        try:
+            args = parse_args(repo)
 
-        if DEBUG or (hasattr(args, "trace") and args.trace):
-            ARC.append("--trace")
+            if DEBUG or (hasattr(args, "trace") and args.trace):
+                ARC.append("--trace")
 
-        repo.set_args(args)
-        args.func(repo, args)
+            repo.set_args(args)
+            args.func(repo, args)
+        finally:
+            repo.cleanup()
     except KeyboardInterrupt:
         pass
     except ReviewError as e:
-        if DEBUG:
-            raise
         logger.error(e)
     except Exception as e:
         if DEBUG:
