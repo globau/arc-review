@@ -16,18 +16,34 @@ Configuration:
 NO_ANSI : disable ANSI output (default: auto-detected)
 IS_DEV  : connect to phabricator dev instance (default: connect to production)
 DEBUG   : enabled debugging output (default: disabled)
+
+e.g. To enable debugging output on MacOS/Linux:
+  $ DEBUG=1 review submit
+
+`review` has an INI style configuration file to control defaults: ~/.review-config
+This file will be created if it doesn't exist.
+
+```
+[submit]
+auto_submit = False
+always_blocking = False
+```
+
+submit.auto_submit: when true the confirmation prompt will be skipped.
+submit.always_blocking: when true reviewers in commit descriptions will be marked as blocking.
+                        note reviewers specified on the command line override this setting.
 """
 
-import re
-import os
-import sys
+import ConfigParser
 import argparse
-import subprocess
 import logging
+import os
+import re
+import subprocess
+import sys
 import tempfile
 import termios
 import tty
-import ConfigParser
 
 # TODO unit tests
 # TODO unicode testing
@@ -84,11 +100,21 @@ ARC_DIFF_REV_RE = re.compile(
     r"^\s*Differential Revision:\s*https://.+/D(\d+)$", flags=re.MULTILINE
 )
 
+# If a commit body matches all of these, reject it.  This is to avoid the
+# necessity to merge arc-style fields across an existing commit description
+# and what we need to set.
+ARC_REJECT_RE_LIST = [
+    re.compile(r"^Summary:", flags=re.MULTILINE),
+    re.compile(r"^Reviewers:", flags=re.MULTILINE),
+]
+
 # Bug and review regexs (from vct's commitparser)
 BUG_ID_RE = re.compile(r"(?:(?:bug|b=)(?:\s*)(\d+)(?=\b))", flags=re.IGNORECASE)
 LIST = r"[;,\/\\]\s*"
 LIST_RE = re.compile(LIST)
-IRC_NICK = r"[a-zA-Z0-9\-\_]+"
+IRC_NICK = (
+    r"[a-zA-Z0-9\-\_!]+"
+)  # Note this includes !, which is different from commitparser
 REVIEWERS_RE = re.compile(
     r"([\s(.\[;,])(r[=?])("
     + IRC_NICK
@@ -101,7 +127,7 @@ REVIEWERS_RE = re.compile(
 R_SPECIFIER_RE = re.compile(r"\br[=?]")
 
 # Does this string look like a revision hash/number?
-REV_RS = re.compile("^(?:[0-9a-f]{7,12,40}|\d+)$").search
+REV_RE = re.compile("^(?:[0-9a-f]{7,12,40}|\d+)$").search
 
 
 #
@@ -153,13 +179,6 @@ def check_output(command, split=True):
     if output:
         logger.debug(output)
     return output.splitlines() if split else output
-
-
-def is_revision(revs):
-    # do all elements in the revs list look like revisions?
-    if not revs:
-        return False
-    return all(REV_RS(r) for r in revs)
 
 
 def prompt(question, options):
@@ -254,14 +273,26 @@ class Config(object):
 
 def find_repo_root():
     """Walk parents to find repository root."""
-    while os.getcwd() != "/":
-        if os.path.exists(".hg") or os.path.exists(".git"):
-            return os.path.abspath(os.getcwd())
-        os.chdir("..")
-    else:
+    # TODO add --path arg to override
+    repo_root = None
+    path = os.path.abspath(os.getcwd())
+    while True:
+        if os.path.exists(os.path.join(path, ".hg")) or os.path.exists(
+            os.path.join(".git")
+        ):
+            if repo_root:
+                raise ReviewError(
+                    "Nested repositories are not supported:\n%s\n%s" % (repo_root, path)
+                )
+            repo_root = path
+        if not os.path.split(path)[1]:
+            break
+        path = os.path.abspath(os.path.join(path, os.path.pardir))
+    if not repo_root:
         raise ReviewError(
             "Not a repository (or any of the parent directories): .hg / .git"
         )
+    return repo_root
 
 
 def repo_from_root(path):
@@ -290,7 +321,7 @@ class Repository(object):
     def commit_stack(self):
         """Return list of { node, summary, body }."""
 
-    def preview_commit_stack(self, commits):
+    def show_commit_stack(self, commits):
         """Log the commit stack in a human readable form."""
 
     def refresh_commit_stack(self, commits):
@@ -312,15 +343,21 @@ class Repository(object):
 
         for commit in commits:
             commit_errors = []
+            # TODO treat bug-id the same as reviewers; update from args, validate if missing, no need for cross-check
             if not self.args.bug and not commit["bug-id"]:
                 commit_errors.append("missing bug-id")
-            if not self.args.reviewer and not commit["reviewers"]:
-                commit_errors.append("missing reviewers")
             if self.args.bug and commit["bug-id"] and self.args.bug != commit["bug-id"]:
                 commit_errors.append(
                     "bug-id mismatch between command line (bug %s) and commit (bug %s)"
                     % (self.args.bug, commit["bug-id"])
                 )
+
+            if not commit["reviewers"]:
+                commit_errors.append("missing reviewers")
+
+            if all(r.search(commit["body"]) for r in ARC_REJECT_RE_LIST):
+                commit_errors.append("contains arc fields")
+
             if commit_errors:
                 errors.append(
                     "%s %s\n- %s"
@@ -355,10 +392,9 @@ class Mercurial(Repository):
             (name, value) = line.split("=", 1)
             hg_config[name] = value
 
+        # Need to use the correct username.
         if "ui.username" not in hg_config:
             raise ReviewError("ui.username is not configured in your hgrc")
-
-        # Need to use the correct username.
         self.hg.extend(["--config", "ui.username=%s" % hg_config["ui.username"]])
 
         # Always need rebase.
@@ -401,37 +437,38 @@ class Mercurial(Repository):
 
         augment_commits_from_body(commits)
 
+        self.revset = "%s::%s" % (commits[0]["node"], commits[-1]["node"])
+
     def add_submit_arguments(self, parser):
         parser.add_argument(
-            "range", nargs="?", default="(auto)", help="Start and end commits to submit"
+            "start_rev",
+            nargs="?",
+            default="(auto)",
+            help="Start revision of range to submit",
+        )
+        parser.add_argument(
+            "end_rev", nargs="?", default=".", help="End revision of range to submit"
         )
 
     def set_args(self, args):
         super(Mercurial, self).set_args(args)
 
-        if self.args.range == "(auto)":
-            # resolve to revision numbers as that's nicer to read
-            try:
-                start = self._hg_log(
-                    "children(last(public())) and (not obsolete())", select="rev"
-                )[0]
-            except IndexError:
-                raise ReviewError("Failed to find draft commits to submit")
-            end = self._hg_log(".", select="rev")[0]
+        if self.args.start_rev == "(auto)":
+            self.args.start_rev = "children(last(public())) and (not obsolete())"
 
-        else:
-            # range of commits, supports either a revision num or sha
-            range_arg = re.sub(r"[: -]", ":", args.range)
-            if ":" in range_arg:
-                (start, end) = range_arg.split(":", 1)
-            else:
-                (start, end) = (range_arg, range_arg)
-            if not is_revision([start, end]):
-                raise ValueError(
-                    "Invalid revision range; use <start_rev>-<end_rev>.  eg. 45-48"
-                )
+        # resolve to nodes as that's nicer to read
+        try:
+            start = self._hg_log(self.args.start_rev)[0]
+        except IndexError:
+            raise ReviewError(
+                "Failed to start of commit range: %s" % self.args.start_rev
+            )
+        try:
+            end = self._hg_log(self.args.end_rev)[0]
+        except IndexError:
+            raise ReviewError("Failed to end of commit rnage: %s" % self.args.end_rev)
 
-        self.revset = "%s::%s" % (start, end)
+        self.revset = "%s::%s" % (start[:12], end[:12])
 
     def commit_stack(self):
         hg_log = check_output(
@@ -446,11 +483,14 @@ class Mercurial(Repository):
                 dict(name="%s:%s" % (rev, node[:12]), node=node, summary=summary)
             )
             body = check_output(self.hg + ["log", "-T", "{desc}", "-r", node])
-            commits[-1]["body"] = "\n".join(body[1:]).rstrip()
+            if body:
+                commits[-1]["body"] = ""
+            else:
+                commits[-1]["body"] = "\n".join(body[1:]).rstrip()
 
         return commits
 
-    def preview_commit_stack(self, commits):
+    def show_commit_stack(self, commits):
         commit_dict = dict(map(lambda co: (co["node"], co), commits))
         log_output = check_output(
             self.hg
@@ -464,11 +504,11 @@ class Mercurial(Repository):
             m = log_rev_re.search(log_line)
             if m:
                 rev = m.group(1)
-                log_line = log_line.replace(rev, commit_dict[rev]["summary"])
+                log_line = log_line.replace(rev, commit_dict[rev]["summary-preview"])
             logger.info(log_line)
 
     def checkout(self, node):
-        check_call(self.hg + ["update", "-q", node])
+        check_call(self.hg + ["update", "--quiet", node])
 
     def amend_commit(self, commit):
         current_body = "%s\n%s" % (commit["summary"], commit["body"])
@@ -484,11 +524,18 @@ class Mercurial(Repository):
             temp_f.flush()
 
             self.checkout(commit["node"])
-            check_call(self.hg + ["commit", "--amend", "-l", temp_f.name])
+            check_call(self.hg + ["commit", "--amend", "--logfile", temp_f.name])
 
     def rebase_commit(self, source_commit, dest_commit):
         check_call(
-            self.hg + ["rebase", "-s", source_commit["node"], "-d", dest_commit["node"]]
+            self.hg
+            + [
+                "rebase",
+                "--source",
+                source_commit["node"],
+                "--dest",
+                dest_commit["node"],
+            ]
         )
 
     def check_commits_for_submit(self, commits):
@@ -515,12 +562,11 @@ class Mercurial(Repository):
                     "%s is based off non-public commit %s" % (ancestor[:12], node[:12])
                 )
 
-        for commit in commits:
-            # Can't submit merge requests
-            parents = self._hg_log("parents(%s)" % commit["node"])
-            if len(parents) > 1:
-                raise ReviewError("%s is a merge commit" % commit["node"][:12])
+        # Can't submit merge requests
+        if self._hg_log("%s and merge()" % self.revset):
+            raise ReviewError("Commit stack contains a merge commit")
 
+        for commit in commits:
             # Follow each branch on the DAG ensuring only one has our nodes
             children = self._hg_log("children(%s)" % commit["node"])
             found = False
@@ -562,12 +608,12 @@ class Git(Repository):
 
 def augment_commits_from_body(commits):
     """Extract metadata from commit body as fields.
-    Adds: diff-id, bug-id, reviewers
+    Adds: rev-id, bug-id, reviewers
     """
 
     for commit in commits:
         m = ARC_DIFF_REV_RE.search(commit["body"])
-        commit["diff-id"] = m.group(1) if m else None
+        commit["rev-id"] = m.group(1) if m else None
 
         # bug-id
         bug_ids = BUG_ID_RE.findall(commit["summary"])
@@ -586,7 +632,7 @@ def augment_commits_from_body(commits):
             reviewers.extend(re.split(LIST_RE, match.group(3)))
         commit["reviewers"] = reviewers
 
-        commit["summary"] = replace_reviewers(commit["summary"], [])
+        commit["summary-preview"] = replace_reviewers(commit["summary"], [])
 
 
 def replace_reviewers(commit_description, reviewers):
@@ -641,32 +687,20 @@ def replace_reviewers(commit_description, reviewers):
 
 
 def update_commits_from_args(commits, args):
-
-    # Process reviewers and blockers from args
-    if args.reviewer:
-        reviewers = dict(
-            (nick.lower(), config.always_blocking) for nick in args.reviewer
-        )
-    else:
-        reviewers = {}
-    if args.blocker:
-        for reviewer in args.blocker:
-            reviewers[reviewer.lower()] = True
-    args.reviewer = map(
-        lambda nick: "%s%s" % (nick[0], "!" if nick[1] else ""), reviewers.items()
-    )
+    # Build list of reviewers from args.
+    reviewers = list(set(args.reviewer)) if args.reviewer else []
+    blockers = list(set(args.blocker)) if args.blocker else []
+    reviewers += ["%s!" % r.rstrip("!") for r in blockers]
 
     # Command args always overwrite commit desc.
-    if args.reviewer:
+    if reviewers:
         for commit in commits:
-            commit["reviewers"] = args.reviewer
+            commit["reviewers"] = reviewers
 
-    # Mark reviewers as blocking when told to always do so.
-    if config.always_blocking:
+    # Otherwise honour config setting to always use blockers
+    elif config.always_blocking:
         for commit in commits:
-            commit["reviewers"] = [
-                "%s!" % nick.rstrip("!") for nick in commit["reviewers"]
-            ]
+            commit["reviewers"] = ["%s!" % r.rstrip("!") for r in commit["reviewers"]]
 
     # Update commit summaries.
     for commit in commits:
@@ -677,7 +711,7 @@ def update_commits_from_args(commits, args):
         if not BUG_ID_RE.search(summary) and not commit["bug-id"] and args.bug:
             summary = "Bug %s - %s" % (args.bug, summary)
 
-        commit["summary"] = summary
+        commit["summary-preview"] = summary
 
 
 def submit(repo, args):
@@ -694,7 +728,7 @@ def submit(repo, args):
     update_commits_from_args(commits, args)
 
     # Validate commit stack is suitable for review
-    repo.preview_commit_stack(commits)
+    repo.show_commit_stack(commits)
     repo.check_commits_for_submit(commits)
 
     if not config.auto_submit:
@@ -714,25 +748,23 @@ def submit(repo, args):
             repo.refresh_commit_stack(commits)
             rebase_onto = None
 
-        if commit["diff-id"]:
-            logger.warning("Updating revision D%s:" % commit["diff-id"])
+        if commit["rev-id"]:
+            logger.warning("Updating revision D%s:" % commit["rev-id"])
         else:
             logger.warning("Creating new revision:")
-        logger.warning("%s %s" % (commit["name"], commit["summary"]))
+        logger.warning("%s %s" % (commit["name"], commit["summary-preview"]))
         repo.checkout(commit["node"])
 
         # Create arc-annotated commit description
         template_vars = dict(
-            summary=commit["summary"],
+            summary=commit["summary-preview"],
             body=commit["body"],
-            reviewers=", ".join(
-                commit["reviewers"] if commit["reviewers"] else args.reviewer
-            ),
-            bug_id=commit["bug-id"] if commit["bug-id"] else args.bug,
+            reviewers=", ".join(commit["reviewers"]),
+            bug_id=commit["bug-id"] if commit["bug-id"] else args.bug,  # TODO fixup
             depends_on="",
         )
         if previous_commit:
-            template_vars["depends_on"] = "Depends on D%s" % previous_commit["diff-id"]
+            template_vars["depends_on"] = "Depends on D%s" % previous_commit["rev-id"]
         arc_commit_desc = ARC_COMMIT_DESC_TEMPLATE.format(**template_vars)
         logger.debug("--- arc message\n%s\n---" % arc_commit_desc)
 
@@ -748,9 +780,9 @@ def submit(repo, args):
                 + ["--message-file", temp_f.name]
             )
 
-            if commit["diff-id"]:
+            if commit["rev-id"]:
                 arc_command.extend(
-                    ["--message", "Revision updated."] + ["--update", commit["diff-id"]]
+                    ["--message", "Revision updated."] + ["--update", commit["rev-id"]]
                 )
             else:
                 arc_command.append("--create")
