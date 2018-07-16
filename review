@@ -50,7 +50,6 @@ import traceback
 import tty
 
 # MVP
-# TODO unicode testing
 # TODO unit tests
 # TODO check reordering
 # TODO reordering and dep cycles
@@ -230,7 +229,7 @@ def prompt(question, options):
     return options[res]
 
 
-class ReviewError(Exception):
+class Error(Exception):
     """Errors throw explictly by this script; won't generate a stack trace."""
 
 
@@ -244,6 +243,7 @@ class Config(object):
         self._filename = os.path.join(os.path.expanduser("~"), ".review-config")
         self._config = ConfigParser.ConfigParser()
         self._config.read([self._filename])
+        self.name = "~/.review-config"  # human-readable name
 
         self.auto_submit = self._get_boolean("submit", "auto_submit", False)
         self.always_blocking = self._get_boolean("submit", "always_blocking", False)
@@ -283,7 +283,6 @@ class Config(object):
 
 def find_repo_root():
     """Walk parents to find repository root."""
-    # TODO add --path arg to override
     repo_root = None
     path = os.path.abspath(os.getcwd())
     while True:
@@ -291,7 +290,7 @@ def find_repo_root():
             os.path.join(".git")
         ):
             if repo_root:
-                raise ReviewError(
+                raise Error(
                     "Nested repositories are not supported:\n%s\n%s" % (repo_root, path)
                 )
             repo_root = path
@@ -299,9 +298,7 @@ def find_repo_root():
             break
         path = os.path.abspath(os.path.join(path, os.path.pardir))
     if not repo_root:
-        raise ReviewError(
-            "Not a repository (or any of the parent directories): .hg / .git"
-        )
+        raise Error("Not a repository (or any of the parent directories): .hg / .git")
     return repo_root
 
 
@@ -314,7 +311,7 @@ def repo_from_root(path):
         return Git(path)
     except ValueError:
         pass
-    raise ReviewError("Failed to find Repository class for %s" % path)
+    raise Error("Failed to find Repository class for %s" % path)
 
 
 class Repository(object):
@@ -329,7 +326,16 @@ class Repository(object):
         self.args = args
 
     def commit_stack(self):
-        """Return list of { node, summary, body }."""
+        """Return list of commits - dicts with the following keys:
+            name            human readable identifier of commit (eg. short sha)
+            node            sha/hash
+            summary         first line of commit description (unaltered)
+            body            commit description, excluding first line
+            summary-preview summary with bug-id and reviewer modifications
+            bug-id          bmo bug-id
+            reviewers       list of reviewers
+            rev-id          phabricator revision id
+        """
 
     def refresh_commit_stack(self, commits):
         """Update the stack following an altering change (eg rebase)."""
@@ -339,7 +345,8 @@ class Repository(object):
         """Checkout/Update to specified node."""
 
     def amend_commit(self, commit):
-        """Amend commit description from `desc` field; return bool indicating if update was required."""
+        """Amend commit description from `desc` field; return bool indicating if
+        update was required."""
 
     def rebase_commit(self, source_commit, dest_commit):
         """Rebase."""
@@ -370,7 +377,7 @@ class Repository(object):
                 )
 
         if errors:
-            raise ReviewError("\n\n".join(errors))
+            raise Error("\n\n".join(errors))
 
 
 #
@@ -385,7 +392,7 @@ class Mercurial(Repository):
         if not os.path.exists(os.path.join(path, ".hg")):
             raise ValueError("%s: not a hg repository" % path)
         if not which("hg"):
-            raise ReviewError("Failed to find 'hg' executable")
+            raise Error("Failed to find 'hg' executable")
 
         logger.debug("found hg repo in %s" % path)
 
@@ -403,7 +410,7 @@ class Mercurial(Repository):
 
         # Need to use the correct username.
         if "ui.username" not in hg_config:
-            raise ReviewError("ui.username is not configured in your hgrc")
+            raise Error("ui.username is not configured in your hgrc")
         self.hg.extend(["--config", "ui.username=%s" % hg_config["ui.username"]])
 
         # Always need rebase.
@@ -414,7 +421,8 @@ class Mercurial(Repository):
             self.hg.extend(["--config", "extensions.evolve="])
             self.use_evolve = True
 
-        # Otherwise just enable obsolescence markers, and remove the obsstore when we're done.
+        # Otherwise just enable obsolescence markers, and remove the obsstore
+        # when we're done.
         else:
             self.hg.extend(["--config", "experimental.evolution.createmarkers=true"])
             self.hg.extend(["--config", "extensions.strip="])
@@ -450,12 +458,17 @@ class Mercurial(Repository):
                 + ["log"]
                 + ["-T", "{rev} {node}\n"]
                 + ["--hidden"]
-                + ["-r", "successors(%s) and not obsolete()" % commit["node"]],
-                split=False,
+                + ["-r", "successors(%s) and not obsolete()" % commit["node"]]
             )
-            # TODO what if there's more than one?
             if hg_log:
-                (rev, node) = hg_log.split(" ", 1)
+                # Not sure the best way to handle multiple successors, so just bail out.
+                if len(hg_log) > 1:
+                    raise Error(
+                        "Multiple successors found for %s, unable to continue"
+                        % commit["node"]
+                    )
+
+                (rev, node) = hg_log[0].split(" ", 1)
                 commit["node"] = node
                 commit["name"] = "%s:%s" % (rev, node[:12])
 
@@ -476,15 +489,13 @@ class Mercurial(Repository):
             start = self._hg_log(start)[0]
         except IndexError:
             if self.args.start_rev == "(auto)":
-                raise ReviewError("Failed to find draft commits to submit")
+                raise Error("Failed to find draft commits to submit")
             else:
-                raise ReviewError(
-                    "Failed to start of commit range: %s" % self.args.start_rev
-                )
+                raise Error("Failed to start of commit range: %s" % self.args.start_rev)
         try:
             end = self._hg_log(self.args.end_rev)[0]
         except IndexError:
-            raise ReviewError("Failed to end of commit range: %s" % self.args.end_rev)
+            raise Error("Failed to end of commit range: %s" % self.args.end_rev)
 
         self.revset = "%s::%s" % (start[:12], end[:12])
 
@@ -498,7 +509,16 @@ class Mercurial(Repository):
         for log_line in hg_log:
             (rev, node, summary) = log_line.split(" ", 2)
             commits.append(
-                dict(name="%s:%s" % (rev, node[:12]), node=node, summary=summary)
+                {
+                    "name": "%s:%s" % (rev, node[:12]),
+                    "node": node,
+                    "summary": summary,
+                    "summary-preview": summary,
+                    "body": "",
+                    "bug-id": None,
+                    "reviewers": [],
+                    "rev-id": None,
+                }
             )
             body = check_output(self.hg + ["log", "-T", "{desc}", "-r", node])
             commits[-1]["body"] = "\n".join(body[1:]).rstrip()
@@ -547,7 +567,7 @@ class Mercurial(Repository):
         # Merge base should be included in the revset
         ancestor = self._hg_log("ancestor(%s)" % self.revset, split=False)
         if ancestor not in nodes:
-            raise ReviewError(
+            raise Error(
                 "Non-linear commit stack (common ancestor %s missing from stack)"
                 % ancestor[:12]
             )
@@ -559,13 +579,13 @@ class Mercurial(Repository):
         for parent in parent_phases:
             (phase, node) = parent.split(" ", 1)
             if phase != "public":
-                raise ReviewError(
+                raise Error(
                     "%s is based off non-public commit %s" % (ancestor[:12], node[:12])
                 )
 
         # Can't submit merge requests
         if self._hg_log("%s and merge()" % self.revset):
-            raise ReviewError("Commit stack contains a merge commit")
+            raise Error("Commit stack contains a merge commit")
 
         for commit in commits:
             # Follow each branch on the DAG ensuring only one has our nodes
@@ -577,7 +597,7 @@ class Mercurial(Repository):
                 )
                 if len(descendants):
                     if found:
-                        raise ReviewError("Non-linear commit stack")
+                        raise Error("Non-linear commit stack")
                     found = True
 
         super(Mercurial, self).check_commits_for_submit(commits)
@@ -595,7 +615,7 @@ class Git(Repository):
         if not os.path.exists(os.path.join(path, ".git")):
             raise ValueError("%s: not a git repository" % path)
         if not which("git"):
-            raise ReviewError("Failed to find 'git' executable")
+            raise Error("Failed to find 'git' executable")
         # TODO draw the rest of the owl
 
         logger.debug("found git repo in %s" % path)
@@ -686,11 +706,11 @@ def replace_reviewers(commit_description, reviewers):
 def show_commit_stack(commits, show_rev_urls=False):
     """Log the commit stack in a human readable form."""
     for commit in commits:
-        logger.warning("%s %s" % (commit["name"], commit["summary"]))
+        logger.warning("%s %s" % (commit["name"], commit["summary-preview"]))
         if show_rev_urls and commit["rev-id"]:
             logger.warning(
                 "%s%sD%s"
-                % (" " * len(commit["name"]), PHABIRCATOR_URL, commit["rev-id"])
+                % (" " * (len(commit["name"]) + 1), PHABIRCATOR_URL, commit["rev-id"])
             )
 
 
@@ -758,7 +778,7 @@ def submit(repo, args):
     # Find and preview commits to submit
     commits = repo.commit_stack()
     if not commits:
-        raise ReviewError("Failed to find any commits to submit")
+        raise Error("Failed to find any commits to submit")
     logger.warning(
         "Submitting %s commit%s:" % (len(commits), "" if len(commits) == 1 else "s")
     )
@@ -771,12 +791,19 @@ def submit(repo, args):
     show_commit_stack(commits)
     try:
         repo.check_commits_for_submit(commits)
-    except ReviewError as e:
+    except Error as e:
         if not args.force:
-            raise ReviewError("Unable to submit commits:\n\n%s" % e)
+            raise Error("Unable to submit commits:\n\n%s" % e)
         logger.error("Ignoring issues found with commits:\n\n%s" % e)
 
-    if not config.auto_submit:
+    # Confirmation prompt
+    if args.yes:
+        pass
+    elif config.auto_submit and not args.interactive:
+        logger.info(
+            "Automatically submitting (as per submit.auto_submit in %s)" % config.name
+        )
+    else:
         res = prompt(
             "Submit to Phabricator%s" % ("-dev" if config.development else ""),
             ["Yes", "No", "Always"],
@@ -797,10 +824,10 @@ def submit(repo, args):
             rebase_onto = None
 
         if commit["rev-id"]:
-            logger.warning("Updating revision D%s:" % commit["rev-id"])
+            logger.info("\nUpdating revision D%s:" % commit["rev-id"])
         else:
-            logger.warning("Creating new revision:")
-        logger.warning("%s %s" % (commit["name"], commit["summary-preview"]))
+            logger.info("\nCreating new revision:")
+        logger.info("%s %s" % (commit["name"], commit["summary-preview"]))
         repo.checkout(commit["node"])
 
         # Create arc-annotated commit description
@@ -836,7 +863,7 @@ def submit(repo, args):
         # Extract Revision URL
         m = ARC_REV_URL_RE.search(arc_output)
         if not m:
-            raise ReviewError("Failed to find 'Revision URL' in arc output")
+            raise Error("Failed to find 'Revision URL' in arc output")
         revision_url = m.group(1)
 
         # Append/replace div rev url to/in commit description
@@ -894,6 +921,18 @@ def parse_args():
         "--path", "-p", help="Set path to repository (default: detected)"
     )
     submit_parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Submit without confirmation (default: %s)" % config.auto_submit,
+    )
+    submit_parser.add_argument(
+        "--interactive",
+        "-i",
+        action="store_true",
+        help="Submit with confirmation (default: %s)" % (not config.auto_submit),
+    )
+    submit_parser.add_argument(
         "--force",
         "-f",
         action="store_true",
@@ -945,7 +984,7 @@ def main():
             PHABIRCATOR_URL = PHABIRCATOR_DEV_URL
 
         if not which("arc"):
-            raise ReviewError(
+            raise Error(
                 "Failed to find 'arc' on the system path.\n"
                 "Please follow the Phabricator setup guide:\n"
                 "%s" % GUIDE_URL
@@ -968,7 +1007,7 @@ def main():
             repo.cleanup()
     except KeyboardInterrupt:
         pass
-    except ReviewError as e:
+    except Error as e:
         logger.error(e)
     except Exception as e:
         logger.error(
