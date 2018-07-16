@@ -27,11 +27,13 @@ This file will be created if it doesn't exist.
 [submit]
 auto_submit = False
 always_blocking = False
+development = False
 ```
 
 submit.auto_submit: when true the confirmation prompt will be skipped.
 submit.always_blocking: when true reviewers in commit descriptions will be marked as blocking.
                         note reviewers specified on the command line override this setting.
+submit.development: connect to development phabricator instance.
 """
 
 import ConfigParser
@@ -44,12 +46,20 @@ import subprocess
 import sys
 import tempfile
 import termios
+import traceback
 import tty
 
-# TODO unit tests
+# MVP
 # TODO unicode testing
-# TODO python3
+# TODO unit tests
+# TODO check reordering
+# TODO reordering and dep cycles
+
+# v1.0
 # TODO windows
+# TODO Git support
+# TODO python3
+
 
 # Environment Vars
 
@@ -72,11 +82,9 @@ GUIDE_URL = (
 )
 
 # URL to post to.
-PHABIRCATOR_URL = (
-    "https://phabricator-dev.allizom.org/"
-    if IS_DEV
-    else "https://phabricator.services.mozilla.com/"
-)
+PHABIRCATOR_PROD_URL = "https://phabricator-dev.allizom.org/"
+PHABIRCATOR_DEV_URL = "https://phabricator.services.mozilla.com/"
+PHABIRCATOR_URL = PHABIRCATOR_PROD_URL
 
 # arc related consts.
 ARC = ["arc"]
@@ -239,6 +247,7 @@ class Config(object):
 
         self.auto_submit = self._get_boolean("submit", "auto_submit", False)
         self.always_blocking = self._get_boolean("submit", "always_blocking", False)
+        self.development = self._get_boolean("submit", "development", False) or IS_DEV
 
         if not os.path.exists(self._filename):
             self.write()
@@ -319,17 +328,12 @@ class Repository(object):
     def set_args(self, args):
         self.args = args
 
-    def add_submit_arguments(self, parser):
-        """Add vcs-specific args to the `submit` command."""
-
     def commit_stack(self):
         """Return list of { node, summary, body }."""
 
-    def show_commit_stack(self, commits):
-        """Log the commit stack in a human readable form."""
-
     def refresh_commit_stack(self, commits):
         """Update the stack following an altering change (eg rebase)."""
+        augment_commits_from_body(commits)
 
     def checkout(self, node):
         """Checkout/Update to specified node."""
@@ -347,15 +351,11 @@ class Repository(object):
 
         for commit in commits:
             commit_errors = []
-            # TODO treat bug-id the same as reviewers; update from args, validate if missing, no need for cross-check
-            # TODO allow NOBUG in commit message only
-            if not self.args.bug and not commit["bug-id"]:
+            # TODO allow NOBUG in commit message (not in arg)
+            # TODO be more relaxed if we're updating an existing rev?
+            # TODO warn if args.bug != commit[bug-id]
+            if not commit["bug-id"]:
                 commit_errors.append("missing bug-id")
-            if self.args.bug and commit["bug-id"] and self.args.bug != commit["bug-id"]:
-                commit_errors.append(
-                    "bug-id mismatch between command line (bug %s) and commit (bug %s)"
-                    % (self.args.bug, commit["bug-id"])
-                )
 
             if not commit["reviewers"]:
                 commit_errors.append("missing reviewers")
@@ -370,7 +370,7 @@ class Repository(object):
                 )
 
         if errors:
-            raise ReviewError("Unable to submit commits:\n\n%s" % "\n\n".join(errors))
+            raise ReviewError("\n\n".join(errors))
 
 
 #
@@ -459,20 +459,9 @@ class Mercurial(Repository):
                 commit["node"] = node
                 commit["name"] = "%s:%s" % (rev, node[:12])
 
-        augment_commits_from_body(commits)
-
         self.revset = "%s::%s" % (commits[0]["node"], commits[-1]["node"])
 
-    def add_submit_arguments(self, parser):
-        parser.add_argument(
-            "start_rev",
-            nargs="?",
-            default="(auto)",
-            help="Start revision of range to submit",
-        )
-        parser.add_argument(
-            "end_rev", nargs="?", default=".", help="End revision of range to submit"
-        )
+        super(Mercurial, self).refresh_commit_stack(commits)
 
     def set_args(self, args):
         super(Mercurial, self).set_args(args)
@@ -516,23 +505,6 @@ class Mercurial(Repository):
 
         return commits
 
-    def show_commit_stack(self, commits):
-        commit_dict = dict(map(lambda co: (co["node"], co), commits))
-        log_output = check_output(
-            self.hg
-            + ["log", "-G"]
-            + ["-T", "{node}\n"]
-            + ["-r", "|".join([c["node"] for c in commits])]
-        )
-        log_rev_re = re.compile(r" ([a-f0-9]{40})$")
-        for log_line in log_output:
-            # Replace the commit's node with the full-formed summary
-            m = log_rev_re.search(log_line)
-            if m:
-                rev = m.group(1)
-                log_line = log_line.replace(rev, commit_dict[rev]["summary-preview"])
-            logger.info(log_line)
-
     def checkout(self, node):
         check_call(self.hg + ["update", "--quiet", node])
 
@@ -571,8 +543,6 @@ class Mercurial(Repository):
 
     def check_commits_for_submit(self, commits):
         nodes = [c["node"] for c in commits]
-
-        # TODO provide an override switch, to skip the potentially expensive or incorrect checks
 
         # Merge base should be included in the revset
         ancestor = self._hg_log("ancestor(%s)" % self.revset, split=False)
@@ -626,10 +596,11 @@ class Git(Repository):
             raise ValueError("%s: not a git repository" % path)
         if not which("git"):
             raise ReviewError("Failed to find 'git' executable")
-        # TODO cinnabar check
         # TODO draw the rest of the owl
 
         logger.debug("found git repo in %s" % path)
+
+        raise NotImplementedError("git support is not yet implemented")
 
 
 #
@@ -712,6 +683,39 @@ def replace_reviewers(commit_description, reviewers):
         return commit_summary.strip() + "\n" + commit_description
 
 
+def show_commit_stack(commits, show_rev_urls=False):
+    """Log the commit stack in a human readable form."""
+    for commit in commits:
+        logger.warning("%s %s" % (commit["name"], commit["summary"]))
+        if show_rev_urls and commit["rev-id"]:
+            logger.warning(
+                "%s%sD%s"
+                % (" " * len(commit["name"]), PHABIRCATOR_URL, commit["rev-id"])
+            )
+
+
+def arc(args):
+    arc_output = check_output(ARC + args, split=False)
+    if logger.level != logging.DEBUG:
+        logger.info(arc_output)
+    return arc_output
+
+
+def arc_message(template_vars):
+    # Map `None` to an empty string
+    for name in template_vars.keys():
+        if template_vars[name] is None:
+            template_vars[name] = ""
+
+    # `depends_on` is optional
+    if "depends_on" not in template_vars:
+        template_vars["depends_on"] = ""
+
+    message = ARC_COMMIT_DESC_TEMPLATE.format(**template_vars)
+    logger.debug("--- arc message\n%s\n---" % message)
+    return message
+
+
 #
 # "submit" Command
 #
@@ -724,12 +728,14 @@ def update_commits_from_args(commits, args):
     reviewers += ["%s!" % r.rstrip("!") for r in blockers]
 
     # Command args always overwrite commit desc.
-    if reviewers:
-        for commit in commits:
+    for commit in commits:
+        if reviewers:
             commit["reviewers"] = reviewers
+        if args.bug:
+            commit["bug-id"] = args.bug
 
     # Otherwise honour config setting to always use blockers
-    elif config.always_blocking:
+    if not reviewers and config.always_blocking:
         for commit in commits:
             commit["reviewers"] = ["%s!" % r.rstrip("!") for r in commit["reviewers"]]
 
@@ -739,8 +745,11 @@ def update_commits_from_args(commits, args):
         summary = replace_reviewers(commit["summary"], commit["reviewers"])
 
         # Bug-ID.
-        if not BUG_ID_RE.search(summary) and not commit["bug-id"] and args.bug:
-            summary = "Bug %s - %s" % (args.bug, summary)
+        if args.bug:
+            if BUG_ID_RE.search(summary):
+                summary = BUG_ID_RE.sub("Bug %s" % args.bug, summary)
+            else:
+                summary = "Bug %s - %s" % (args.bug, summary)
 
         commit["summary-preview"] = summary
 
@@ -759,12 +768,17 @@ def submit(repo, args):
     update_commits_from_args(commits, args)
 
     # Validate commit stack is suitable for review
-    repo.show_commit_stack(commits)
-    repo.check_commits_for_submit(commits)
+    show_commit_stack(commits)
+    try:
+        repo.check_commits_for_submit(commits)
+    except ReviewError as e:
+        if not args.force:
+            raise ReviewError("Unable to submit commits:\n\n%s" % e)
+        logger.error("Ignoring issues found with commits:\n\n%s" % e)
 
     if not config.auto_submit:
         res = prompt(
-            "Submit to Phabricator%s" % "-dev" if IS_DEV else "",
+            "Submit to Phabricator%s" % ("-dev" if config.development else ""),
             ["Yes", "No", "Always"],
         )
         if res == "No":
@@ -794,36 +808,30 @@ def submit(repo, args):
             summary=commit["summary-preview"],
             body=commit["body"],
             reviewers=", ".join(commit["reviewers"]),
-            bug_id=commit["bug-id"] if commit["bug-id"] else args.bug,  # TODO fixup
-            depends_on="",
+            bug_id=commit["bug-id"],
         )
         if previous_commit:
             template_vars["depends_on"] = "Depends on D%s" % previous_commit["rev-id"]
-        arc_commit_desc = ARC_COMMIT_DESC_TEMPLATE.format(**template_vars)
-        logger.debug("--- arc message\n%s\n---" % arc_commit_desc)
+        message = arc_message(template_vars)
 
         # Run arc
         with tempfile.NamedTemporaryFile() as temp_f:
-            temp_f.write(arc_commit_desc)
+            temp_f.write(message)
             temp_f.flush()
 
-            arc_command = (
-                ARC
-                + ["diff"]
+            arc_args = (
+                ["diff"]
                 + ["--allow-untracked", "--no-amend", "--no-ansi"]
                 + ["--message-file", temp_f.name]
             )
-
             if commit["rev-id"]:
-                arc_command.extend(
+                arc_args.extend(
                     ["--message", "Revision updated."] + ["--update", commit["rev-id"]]
                 )
             else:
-                arc_command.append("--create")
+                arc_args.append("--create")
 
-            arc_output = check_output(arc_command, split=False)
-            if logger.level != logging.DEBUG:
-                logger.info(arc_output)
+            arc_output = arc(arc_args)
 
         # Extract Revision URL
         m = ARC_REV_URL_RE.search(arc_output)
@@ -845,6 +853,9 @@ def submit(repo, args):
             rebase_onto = commit
 
         previous_commit = commit
+
+    logger.warning("Completed")
+    show_commit_stack(commits, show_rev_urls=True)
 
 
 #
@@ -869,11 +880,9 @@ def init_logging():
     stdout_handler.setFormatter(logging.Formatter("%(message)s"))
     logger.addHandler(stdout_handler)
     logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
-    if not DEBUG:
-        sys.tracebacklimit = 0
 
 
-def parse_args(repo):
+def parse_args():
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command")
     commands.required = True
@@ -881,34 +890,59 @@ def parse_args(repo):
     submit_parser = commands.add_parser(
         "submit", help="Submit commits(s) to Phabricator"
     )
+    submit_parser.add_argument(
+        "--path", "-p", help="Set path to repository (default: detected)"
+    )
+    submit_parser.add_argument(
+        "--force",
+        "-f",
+        action="store_true",
+        help="Force submission even if commit stack validation fails",
+    )
     submit_parser.add_argument("--bug", "-b", help="Set Bug ID for all commits")
     submit_parser.add_argument(
         "--reviewer",
         "--reviewers",
         "-r",
         action="append",
-        help="Set review(s) for all commits",
+        help="Set review(s) for all commits (default: from commit)",
     )
     submit_parser.add_argument(
         "--blocker",
         "--blocker",
         "-R",
         action="append",
-        help="Set blocking review(s) for all commits",
+        help="Set blocking review(s) for all commits (default: from commit)",
     )
+    parser.add_argument(
+        "start_rev",
+        nargs="?",
+        default="(auto)",
+        help="Start revision of range to submit (default: detected)",
+    )
+    parser.add_argument(
+        "end_rev",
+        nargs="?",
+        default=".",
+        help="End revision of range to submit (default: current commit)",
+    )
+
     # arc informs users to pass --trace for more output, so we need to accept it
     submit_parser.add_argument("--trace", action="store_true", help=argparse.SUPPRESS)
-    repo.add_submit_arguments(submit_parser)
-    submit_parser.set_defaults(func=submit)
 
+    submit_parser.set_defaults(func=submit)
     return parser.parse_args()
 
 
 def main():
     global config
+    global PHABIRCATOR_URL
     try:
         init_logging()
         config = Config()
+
+        if config.development:
+            PHABIRCATOR_URL = PHABIRCATOR_DEV_URL
 
         if not which("arc"):
             raise ReviewError(
@@ -917,13 +951,17 @@ def main():
                 "%s" % GUIDE_URL
             )
 
-        repo = repo_from_root(find_repo_root())
+        args = parse_args()
+
+        if DEBUG or (hasattr(args, "trace") and args.trace):
+            ARC.append("--trace")
+
+        if args.path:
+            os.chdir(args.path)
+            repo = repo_from_root(args.path)
+        else:
+            repo = repo_from_root(find_repo_root())
         try:
-            args = parse_args(repo)
-
-            if DEBUG or (hasattr(args, "trace") and args.trace):
-                ARC.append("--trace")
-
             repo.set_args(args)
             args.func(repo, args)
         finally:
@@ -933,13 +971,9 @@ def main():
     except ReviewError as e:
         logger.error(e)
     except Exception as e:
-        if DEBUG:
-            raise
-        logger.error("%s: %s" % (e.__class__.__name__, e))
-
-
-# TODO check reordering
-# TODO reordering and dep cycles
+        logger.error(
+            traceback.format_exc() if DEBUG else "%s: %s" % (e.__class__.__name__, e)
+        )
 
 
 if __name__ == "__main__":
