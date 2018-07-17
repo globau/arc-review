@@ -10,44 +10,26 @@ Goals:
 - must only use standard libraries
 - must be a single file for easy deployment
 - should work on python 2.7 and python 3.5+
-
-Configuration:
-`review` is configured via the following environmental variables:
-NO_ANSI : disable ANSI output (default: auto-detected)
-IS_DEV  : connect to phabricator dev instance (default: connect to production)
-DEBUG   : enabled debugging output (default: disabled)
-
-e.g. To enable debugging output on MacOS/Linux:
-  $ DEBUG=1 review submit
-
-`review` has an INI style configuration file to control defaults: ~/.review-config
-This file will be created if it doesn't exist.
-
-```
-[submit]
-auto_submit = False
-always_blocking = False
-development = False
-```
-
-submit.auto_submit: when true the confirmation prompt will be skipped.
-submit.always_blocking: when true reviewers in commit descriptions will be marked as blocking.
-                        note reviewers specified on the command line override this setting.
-submit.development: connect to development phabricator instance.
 """
 
 import ConfigParser
 import argparse
+import calendar
+import datetime
 import errno
+import json
 import logging
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
 import termios
+import time
 import traceback
 import tty
+import urllib2
 
 # MVP
 # TODO unit tests
@@ -68,7 +50,8 @@ HAS_ANSI = (
     (hasattr(sys.stdout, "isatty") and sys.stdout.isatty())
     or os.getenv("TERM", "") == "ANSI"
     or os.getenv("PYCHARM_HOSTED", "") == "1"
-) and not os.getenv("NO_ANSI")
+)
+SELF_FILE = os.getenv("UPDATE_FILE") if os.getenv("UPDATE_FILE") else __file__
 
 # Constants and Globals
 
@@ -79,6 +62,10 @@ config = None
 GUIDE_URL = (
     "http://moz-conduit.readthedocs.io/en/latest/phabricator-user.html#quick-start"
 )
+
+# Auto-update
+UPDATE_REPO = "globau/arc-review"
+UPDATE_FREQUENCY = 72  # hours
 
 # URL to post to.
 PHABIRCATOR_PROD_URL = "https://phabricator-dev.allizom.org/"
@@ -170,6 +157,11 @@ def shell_quote(s):
     return "'" + s.replace("'", "'\"'\"'").replace("\n", "\\n") + "'"
 
 
+def parse_zulu_time(timestamp):
+    """Parse YYYY-MM-DDTHH:mm:SSZ date string, return as epoch seconds in local tz."""
+    return calendar.timegm(time.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ"))
+
+
 def check_call(command, *args):
     # wrapper around subprocess.check_call with debug output
     logger.debug("$ %s" % " ".join(shell_quote(s) for s in command))
@@ -245,9 +237,10 @@ class Config(object):
         self._config.read([self._filename])
         self.name = "~/.review-config"  # human-readable name
 
+        self.no_ansi = self._get_boolean("ui", "no_ansi", False)
         self.auto_submit = self._get_boolean("submit", "auto_submit", False)
         self.always_blocking = self._get_boolean("submit", "always_blocking", False)
-        self.development = self._get_boolean("submit", "development", False) or IS_DEV
+        self.updater_last_check = self._get_int("updater", "last_check", 0)
 
         if not os.path.exists(self._filename):
             self.write()
@@ -261,16 +254,28 @@ class Config(object):
             logger.debug("using default config %s.%s: %s" % (section, option, default))
             return default
 
+    def _get_int(self, section, option, default):
+        try:
+            value = self._config.getint(section, option)
+            logger.debug("read config %s.%s: %s" % (section, option, value))
+            return value
+        except (ValueError, ConfigParser.NoSectionError, ConfigParser.NoOptionError):
+            logger.debug("using default config %s.%s: %s" % (section, option, default))
+            return default
+
     def write(self):
         if os.path.exists(self._filename):
-            logger.info("updating %s" % self._filename)
+            logger.debug("updating %s" % self._filename)
         else:
-            logger.info("creating %s" % self._filename)
+            logger.debug("creating %s" % self._filename)
 
         if not self._config.has_section("submit"):
             self._config.add_section("submit")
         self._config.set("submit", "auto_submit", self.auto_submit)
-        self._config.set("submit", "always_blocking", self.always_blocking)
+
+        if not self._config.has_section("updater"):
+            self._config.add_section("updater")
+        self._config.set("updater", "last_check", self.updater_last_check)
 
         with open(self._filename, "w") as f:
             self._config.write(f)
@@ -281,37 +286,49 @@ class Config(object):
 #
 
 
-def find_repo_root():
-    """Walk parents to find repository root."""
-    repo_root = None
-    path = os.path.abspath(os.getcwd())
-    while True:
-        if os.path.exists(os.path.join(path, ".hg")) or os.path.exists(
-            os.path.join(".git")
-        ):
-            if repo_root:
-                raise Error(
-                    "Nested repositories are not supported:\n%s\n%s" % (repo_root, path)
-                )
-            repo_root = path
-        if not os.path.split(path)[1]:
-            break
-        path = os.path.abspath(os.path.join(path, os.path.pardir))
-    if not repo_root:
-        raise Error("Not a repository (or any of the parent directories): .hg / .git")
-    return repo_root
+def repo_from_args(args):
+    if hasattr(args, "path") and args.path:
+        repo_path = args.path
 
+    else:
+        # Walk parents to find repository root.
+        repo_path = None
+        path = os.path.abspath(os.getcwd())
+        while True:
+            if os.path.exists(os.path.join(path, ".hg")) or os.path.exists(
+                os.path.join(".git")
+            ):
+                if repo_path:
+                    raise Error(
+                        "Nested repositories are not supported:\n%s\n%s"
+                        % (repo_path, path)
+                    )
+                repo_path = path
+            if not os.path.split(path)[1]:
+                break
+            path = os.path.abspath(os.path.join(path, os.path.pardir))
+        if not repo_path:
+            raise Error(
+                "Not a repository (or any of the parent directories): .hg / .git"
+            )
 
-def repo_from_root(path):
+    os.chdir(repo_path)
+
+    repo = None
     try:
-        return Mercurial(path)
+        repo = Mercurial(repo_path)
     except ValueError:
         pass
-    try:
-        return Git(path)
-    except ValueError:
-        pass
-    raise Error("Failed to find Repository class for %s" % path)
+    if not repo:
+        try:
+            repo = Git(repo_path)
+        except ValueError:
+            pass
+    if not repo:
+        raise Error("Failed to find Repository class for %s" % repo_path)
+
+    repo.set_args(args)
+    return repo
 
 
 class Repository(object):
@@ -775,6 +792,9 @@ def update_commits_from_args(commits, args):
 
 
 def submit(repo, args):
+    if DEBUG or (hasattr(args, "trace") and args.trace):
+        ARC.append("--trace")
+
     # Find and preview commits to submit
     commits = repo.commit_stack()
     if not commits:
@@ -886,6 +906,84 @@ def submit(repo, args):
 
 
 #
+# Self-Updater
+#
+
+
+def get_self_release():
+    releases_api_url = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
+    logger.debug("fetching %s" % releases_api_url)
+
+    try:
+        release = json.load(urllib2.urlopen(releases_api_url))
+    except (urllib2.HTTPError, urllib2.URLError) as e:
+        raise Error("Failed to check for updates: %s" % e)
+    except ValueError:
+        raise Error("Malformed response from GitHub when checking for updates")
+    logger.debug(release)
+
+    published_at = parse_zulu_time(release["published_at"])
+    try:
+        m_time = os.path.getmtime(SELF_FILE)
+    except OSError as e:
+        if e.errno != errno.ENOENT:
+            raise
+        m_time = 0
+    logger.debug("published_at: %s" % datetime.datetime.fromtimestamp(published_at))
+    logger.debug("m_time: %s" % datetime.datetime.fromtimestamp(m_time))
+
+    return dict(
+        published_at=published_at,
+        update_required=published_at > m_time,
+        tag=str(release["tag_name"]),
+    )
+
+
+def check_self_update():
+    if IS_DEV:
+        logger.debug("skipping self-update check in development mode")
+        return
+
+    if time.time() - config.updater_last_check < UPDATE_FREQUENCY * 60 * 60:
+        logger.debug("update check not required")
+        return
+    config.updater_last_check = int(time.time())
+    config.write()
+
+    release = get_self_release()
+    if not release["update_required"]:
+        return
+
+    logger.info("Version %s of `review` is now available" % release["tag"])
+    logger.info("Run `review self-update` to update")
+
+
+def self_update(args):
+    release = get_self_release()
+
+    if not release["update_required"] and not args.force:
+        logger.warning("Update not required")
+        return
+
+    logger.warning("Updating to v%s" % release["tag"])
+
+    url = "https://raw.githubusercontent.com/%s/%s/review" % (
+        UPDATE_REPO,
+        release["tag"],
+    )
+    logger.debug("updating '%s' from %s" % (SELF_FILE, url))
+    try:
+        gh = urllib2.urlopen(url)
+        with open(SELF_FILE, "wb") as fh:
+            fh.write(gh.read())
+        os.chmod(SELF_FILE, stat.S_IRWXU)
+    except (urllib2.HTTPError, urllib2.URLError) as e:
+        raise Error("Failed to download update: %s" % e)
+
+    logger.info("%s updated" % SELF_FILE)
+
+
+#
 # Main
 #
 
@@ -913,6 +1011,8 @@ def parse_args():
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command")
     commands.required = True
+
+    # submit
 
     submit_parser = commands.add_parser(
         "submit", help="Submit commits(s) to Phabricator"
@@ -969,19 +1069,27 @@ def parse_args():
     # arc informs users to pass --trace for more output, so we need to accept it
     submit_parser.add_argument("--trace", action="store_true", help=argparse.SUPPRESS)
 
-    submit_parser.set_defaults(func=submit)
+    submit_parser.set_defaults(func=submit, needs_repo=True)
+
+    # self-update
+
+    update_parser = commands.add_parser("self-update", help="Update review script")
+    update_parser.add_argument(
+        "--force", "-f", action="store_true", help="Force update even if not necessary"
+    )
+    update_parser.set_defaults(func=self_update, needs_repo=False)
+
     return parser.parse_args()
 
 
 def main():
-    global config
-    global PHABIRCATOR_URL
+    global config, HAS_ANSI
     try:
         init_logging()
         config = Config()
 
-        if config.development:
-            PHABIRCATOR_URL = PHABIRCATOR_DEV_URL
+        if config.no_ansi:
+            HAS_ANSI = False
 
         if not which("arc"):
             raise Error(
@@ -992,19 +1100,19 @@ def main():
 
         args = parse_args()
 
-        if DEBUG or (hasattr(args, "trace") and args.trace):
-            ARC.append("--trace")
+        if args.command != "self-update":
+            check_self_update()
 
-        if args.path:
-            os.chdir(args.path)
-            repo = repo_from_root(args.path)
+        if args.needs_repo:
+            repo = repo_from_args(args)
+            try:
+                args.func(repo, args)
+            finally:
+                repo.cleanup()
+
         else:
-            repo = repo_from_root(find_repo_root())
-        try:
-            repo.set_args(args)
-            args.func(repo, args)
-        finally:
-            repo.cleanup()
+            args.func(args)
+
     except KeyboardInterrupt:
         pass
     except Error as e:
