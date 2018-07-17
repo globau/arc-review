@@ -33,13 +33,18 @@ import urllib2
 
 # MVP
 # TODO unit tests
-# TODO check reordering
-# TODO reordering and dep cycles
 
 # v1.0
 # TODO windows
 # TODO Git support
 # TODO python3
+
+# Known Issues
+# - reordering, folding, etc commits doesn't result in the stack being updated
+#   correctly on phabricator, or may outright fail due to dependency loops.
+#   to address this we'll need to talk to phabricator directly to query the current
+#   stack, and clear dependencies prior to calling arc. we'd probably also have to
+#   abandon revisions that are no longer part of the stack.
 
 
 # Environment Vars
@@ -296,12 +301,12 @@ def repo_from_args(args):
         path = os.path.abspath(os.getcwd())
         while True:
             if os.path.exists(os.path.join(path, ".hg")) or os.path.exists(
-                os.path.join(".git")
+                os.path.join(path, ".git")
             ):
                 if repo_path:
                     raise Error(
-                        "Nested repositories are not supported:\n%s\n%s"
-                        % (repo_path, path)
+                        "Nested repositories are not supported:\n%s\n%s\n"
+                        "Specify a path using --path" % (repo_path, path)
                     )
                 repo_path = path
             if not os.path.split(path)[1]:
@@ -825,7 +830,7 @@ def submit(repo, args):
         )
     else:
         res = prompt(
-            "Submit to Phabricator%s" % ("-dev" if config.development else ""),
+            "Submit to Phabricator%s" % ("-dev" if IS_DEV else ""),
             ["Yes", "No", "Always"],
         )
         if res == "No":
@@ -954,7 +959,7 @@ def check_self_update():
     if not release["update_required"]:
         return
 
-    logger.info("Version %s of `review` is now available" % release["tag"])
+    logger.warning("Version %s of `review` is now available" % release["tag"])
     logger.info("Run `review self-update` to update")
 
 
