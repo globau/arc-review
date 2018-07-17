@@ -1014,7 +1014,7 @@ def init_logging():
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    commands = parser.add_subparsers(dest="command")
+    commands = parser.add_subparsers(dest="command", metavar="COMMAND")
     commands.required = True
 
     # submit
@@ -1058,13 +1058,13 @@ def parse_args():
         action="append",
         help="Set blocking review(s) for all commits (default: from commit)",
     )
-    parser.add_argument(
+    submit_parser.add_argument(
         "start_rev",
         nargs="?",
         default="(auto)",
         help="Start revision of range to submit (default: detected)",
     )
-    parser.add_argument(
+    submit_parser.add_argument(
         "end_rev",
         nargs="?",
         default=".",
