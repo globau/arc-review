@@ -73,9 +73,9 @@ UPDATE_REPO = "globau/arc-review"
 UPDATE_FREQUENCY = 72  # hours
 
 # URL to post to.
-PHABIRCATOR_PROD_URL = "https://phabricator-dev.allizom.org/"
-PHABIRCATOR_DEV_URL = "https://phabricator.services.mozilla.com/"
-PHABIRCATOR_URL = PHABIRCATOR_PROD_URL
+PHABIRCATOR_PROD_URL = "https://phabricator.services.mozilla.com/"
+PHABIRCATOR_DEV_URL = "https://phabricator-dev.allizom.org/"
+PHABIRCATOR_URL = PHABIRCATOR_DEV_URL if IS_DEV else PHABIRCATOR_PROD_URL
 
 # arc related consts.
 ARC = ["arc"]
