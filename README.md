@@ -37,7 +37,7 @@ last_check = <time>
 `review` can also be configured via the following environmental variables:
 - `IS_DEV` : connect to phabricator dev instance (default: connect to production)
 - `DEBUG` : enabled debugging output (default: disabled)
-- `UPDATE_FILE` : when self-updating write to this file instead of __file__
+- `UPDATE_FILE` : when self-updating write to this file instead of \_\_file\_\_
 
 e.g. To enable debugging output on MacOS/Linux:
 ```

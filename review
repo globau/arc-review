@@ -347,6 +347,9 @@ class Repository(object):
     def set_args(self, args):
         self.args = args
 
+    def uncommitted(self):
+        """Return a list of uncommitted files."""
+
     def commit_stack(self):
         """Return list of commits - dicts with the following keys:
             name            human readable identifier of commit (eg. short sha)
@@ -355,6 +358,7 @@ class Repository(object):
             body            commit description, excluding first line
             summary-preview summary with bug-id and reviewer modifications
             bug-id          bmo bug-id
+            bug-id-orig     original bug-id from commit desc
             reviewers       list of reviewers
             rev-id          phabricator revision id
         """
@@ -382,7 +386,6 @@ class Repository(object):
             commit_errors = []
             # TODO allow NOBUG in commit message (not in arg)
             # TODO be more relaxed if we're updating an existing rev?
-            # TODO warn if args.bug != commit[bug-id]
             if not commit["bug-id"]:
                 commit_errors.append("missing bug-id")
 
@@ -470,6 +473,11 @@ class Mercurial(Repository):
     def _hg_log(self, revset, split=True, select="node"):
         return check_output(
             self.hg + ["log", "-T", "{%s}\n" % select, "-r", revset], split=split
+        )
+
+    def uncommitted(self):
+        return check_output(
+            self.hg + ["status", "--unknown", "-T", "{path}\n"], split=True
         )
 
     def refresh_commit_stack(self, commits):
@@ -574,13 +582,9 @@ class Mercurial(Repository):
     def rebase_commit(self, source_commit, dest_commit):
         check_call(
             self.hg
-            + [
-                "rebase",
-                "--source",
-                source_commit["node"],
-                "--dest",
-                dest_commit["node"],
-            ]
+            + ["rebase"]
+            + ["--source", source_commit["node"]]
+            + ["--dest", dest_commit["node"]]
         )
 
     def check_commits_for_submit(self, commits):
@@ -667,6 +671,8 @@ def augment_commits_from_body(commits):
             commit["bug-id"] = bug_ids[0]
         else:
             commit["bug-id"] = None
+        if "bug-id-orig" not in commit:
+            commit["bug-id-orig"] = commit["bug-id"]
 
         # reviewers
         reviewers = []
@@ -676,7 +682,26 @@ def augment_commits_from_body(commits):
             reviewers.extend(re.split(LIST_RE, match.group(3)))
         commit["reviewers"] = reviewers
 
-        commit["summary-preview"] = replace_reviewers(commit["summary"], [])
+    update_commit_summary_previews(commits)
+
+
+def update_commit_summary_previews(commits):
+    """Update summary-preview from commit metadata"""
+    for commit in commits:
+        # Reviewers.
+        summary = replace_reviewers(commit["summary"], commit["reviewers"])
+
+        # Bug-ID.
+        if commit["bug-id"]:
+            if BUG_ID_RE.search(summary):
+                summary = BUG_ID_RE.sub("Bug %s" % commit["bug-id"], summary)
+            else:
+                summary = "Bug %s - %s" % (commit["bug-id"], summary)
+        else:
+            # This is likely to result in unappealing results.
+            summary = BUG_ID_RE.sub("", summary)
+
+        commit["summary-preview"] = summary
 
 
 def replace_reviewers(commit_description, reviewers):
@@ -725,15 +750,18 @@ def replace_reviewers(commit_description, reviewers):
         return commit_summary.strip() + "\n" + commit_description
 
 
-def show_commit_stack(commits, show_rev_urls=False):
+def show_commit_stack(commits, show_rev_urls=False, show_warnings=False):
     """Log the commit stack in a human readable form."""
     for commit in commits:
-        logger.warning("%s %s" % (commit["name"], commit["summary-preview"]))
+        logger.info("%s %s" % (commit["name"], commit["summary-preview"]))
+        if show_warnings:
+            if commit["bug-id-orig"] and commit["bug-id"] != commit["bug-id-orig"]:
+                logger.warning(
+                    "!! Bug ID changed from %s to %s"
+                    % (commit["bug-id-orig"], commit["bug-id"])
+                )
         if show_rev_urls and commit["rev-id"]:
-            logger.warning(
-                "%s%sD%s"
-                % (" " * (len(commit["name"]) + 1), PHABIRCATOR_URL, commit["rev-id"])
-            )
+            logger.warning("-> %sD%s" % (PHABIRCATOR_URL, commit["rev-id"]))
 
 
 def arc(args):
@@ -781,19 +809,7 @@ def update_commits_from_args(commits, args):
         for commit in commits:
             commit["reviewers"] = ["%s!" % r.rstrip("!") for r in commit["reviewers"]]
 
-    # Update commit summaries.
-    for commit in commits:
-        # Reviewers.
-        summary = replace_reviewers(commit["summary"], commit["reviewers"])
-
-        # Bug-ID.
-        if args.bug:
-            if BUG_ID_RE.search(summary):
-                summary = BUG_ID_RE.sub("Bug %s" % args.bug, summary)
-            else:
-                summary = "Bug %s - %s" % (args.bug, summary)
-
-        commit["summary-preview"] = summary
+    update_commit_summary_previews(commits)
 
 
 def submit(repo, args):
@@ -813,13 +829,24 @@ def submit(repo, args):
     update_commits_from_args(commits, args)
 
     # Validate commit stack is suitable for review
-    show_commit_stack(commits)
+    show_commit_stack(commits, show_warnings=True)
     try:
         repo.check_commits_for_submit(commits)
     except Error as e:
         if not args.force:
             raise Error("Unable to submit commits:\n\n%s" % e)
         logger.error("Ignoring issues found with commits:\n\n%s" % e)
+
+    # Show a warning if there are uncommitted files
+    uncommitted = repo.uncommitted()
+    if uncommitted:
+        logger.warning(
+            "Warning: found %s uncommitted file%s:"
+            % (len(uncommitted), "" if len(uncommitted) == 1 else "s")
+        )
+        if len(uncommitted) <= 5:
+            for filename in uncommitted:
+                logger.info("  %s" % filename)
 
     # Confirmation prompt
     if args.yes:
@@ -898,7 +925,8 @@ def submit(repo, args):
             body += "\n"
         body += "\nDifferential Revision: %s" % revision_url
 
-        if commit["body"] != body:
+        if commit["summary-preview"] != commit["summary"] or body != commit["body"]:
+            commit["summary"] = commit["summary-preview"]
             commit["body"] = body
             repo.amend_commit(commit)
             repo.refresh_commit_stack(commits)
@@ -906,7 +934,7 @@ def submit(repo, args):
 
         previous_commit = commit
 
-    logger.warning("Completed")
+    logger.warning("\nCompleted")
     show_commit_stack(commits, show_rev_urls=True)
 
 
