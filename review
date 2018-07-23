@@ -97,10 +97,10 @@ Bug #: {bug_id}
 """.strip()
 ARC_REV_URL_RE = re.compile(r"^\s*Revision URI: (http.+)$", flags=re.MULTILINE)
 ARC_DIFF_REV_RE = re.compile(
-    r"^\s*Differential Revision:\s*https://.+/D(\d+)$", flags=re.MULTILINE
+    r"^\s*Differential Revision:\s*https://.+/D(\d+)\s*$", flags=re.MULTILINE
 )
 
-# If a commit body matches all of these, reject it.  This is to avoid the
+# If a commit body matches **all** of these, reject it.  This is to avoid the
 # necessity to merge arc-style fields across an existing commit description
 # and what we need to set.
 ARC_REJECT_RE_LIST = [
@@ -125,9 +125,6 @@ REVIEWERS_RE = re.compile(
     + r")*)?"
 )
 R_SPECIFIER_RE = re.compile(r"\br[=?]")
-
-# Does this string look like a revision hash/number?
-REV_RE = re.compile("^(?:[0-9a-f]{7,12,40}|\d+)$").search
 
 
 #
@@ -154,6 +151,7 @@ def which(filename):
 
 def shell_quote(s):
     # backport of shutil.quote from py3
+    # used for debugging output only
     _find_unsafe = re.compile(r"[^\w@%+=:,./-]").search
     if not s:
         return "''"
@@ -245,6 +243,7 @@ class Config(object):
         self.no_ansi = self._get_boolean("ui", "no_ansi", False)
         self.auto_submit = self._get_boolean("submit", "auto_submit", False)
         self.always_blocking = self._get_boolean("submit", "always_blocking", False)
+        self.warn_uncommitted = self._get_boolean("submit", "warn_uncommitted", True)
         self.updater_last_check = self._get_int("updater", "last_check", 0)
 
         if not os.path.exists(self._filename):
@@ -271,16 +270,25 @@ class Config(object):
     def write(self):
         if os.path.exists(self._filename):
             logger.debug("updating %s" % self._filename)
+
+            if not self._config.has_section("submit"):
+                self._config.add_section("submit")
+            self._config.set("submit", "auto_submit", self.auto_submit)
+
+            if not self._config.has_section("updater"):
+                self._config.add_section("updater")
+            self._config.set("updater", "last_check", self.updater_last_check)
+
         else:
             logger.debug("creating %s" % self._filename)
 
-        if not self._config.has_section("submit"):
-            self._config.add_section("submit")
-        self._config.set("submit", "auto_submit", self.auto_submit)
+            self._config.add_section("ui")
+            self._config.set("ui", "no_ansi", self.no_ansi)
 
-        if not self._config.has_section("updater"):
-            self._config.add_section("updater")
-        self._config.set("updater", "last_check", self.updater_last_check)
+            self._config.add_section("submit")
+            self._config.set("submit", "auto_submit", self.auto_submit)
+            self._config.set("submit", "always_blocking", self.always_blocking)
+            self._config.set("submit", "warn_uncommitted", self.warn_uncommitted)
 
         with open(self._filename, "w") as f:
             self._config.write(f)
@@ -392,7 +400,7 @@ class Repository(object):
             if not commit["reviewers"]:
                 commit_errors.append("missing reviewers")
 
-            if all(r.search(commit["body"]) for r in ARC_REJECT_RE_LIST):
+            if has_arc_rejections(commit["body"]):
                 commit_errors.append("contains arc fields")
 
             if commit_errors:
@@ -654,17 +662,38 @@ class Git(Repository):
 #
 
 
+def parse_arc_diff_rev(body):
+    m = ARC_DIFF_REV_RE.search(body)
+    return m.group(1) if m else None
+
+
+def parse_bugs(summary):
+    return BUG_ID_RE.findall(summary)
+
+
+def parse_reviewers(summary):
+    reviewers = []
+    for match in re.finditer(REVIEWERS_RE, summary):
+        if not match.group(3):
+            continue
+        reviewers.extend(re.split(LIST_RE, match.group(3)))
+    return reviewers
+
+
+def has_arc_rejections(body):
+    return all(r.search(body) for r in ARC_REJECT_RE_LIST)
+
+
 def augment_commits_from_body(commits):
     """Extract metadata from commit body as fields.
     Adds: rev-id, bug-id, reviewers
     """
 
     for commit in commits:
-        m = ARC_DIFF_REV_RE.search(commit["body"])
-        commit["rev-id"] = m.group(1) if m else None
+        commit["rev-id"] = parse_arc_diff_rev(commit["body"])
 
         # bug-id
-        bug_ids = BUG_ID_RE.findall(commit["summary"])
+        bug_ids = parse_bugs(commit["summary"])
         if bug_ids:
             if len(bug_ids) > 1:
                 logger.warning("Multiple bug-IDs found, using %s" % bug_ids[0])
@@ -675,12 +704,7 @@ def augment_commits_from_body(commits):
             commit["bug-id-orig"] = commit["bug-id"]
 
         # reviewers
-        reviewers = []
-        for match in re.finditer(REVIEWERS_RE, commit["summary"]):
-            if not match.group(3):
-                continue
-            reviewers.extend(re.split(LIST_RE, match.group(3)))
-        commit["reviewers"] = reviewers
+        commit["reviewers"] = parse_reviewers(commit["summary"])
 
     update_commit_summary_previews(commits)
 
@@ -838,15 +862,16 @@ def submit(repo, args):
         logger.error("Ignoring issues found with commits:\n\n%s" % e)
 
     # Show a warning if there are uncommitted files
-    uncommitted = repo.uncommitted()
-    if uncommitted:
-        logger.warning(
-            "Warning: found %s uncommitted file%s:"
-            % (len(uncommitted), "" if len(uncommitted) == 1 else "s")
-        )
-        if len(uncommitted) <= 5:
-            for filename in uncommitted:
-                logger.info("  %s" % filename)
+    if config.warn_uncommitted:
+        uncommitted = repo.uncommitted()
+        if uncommitted:
+            logger.warning(
+                "Warning: found %s uncommitted file%s:"
+                % (len(uncommitted), "" if len(uncommitted) == 1 else "s")
+            )
+            if len(uncommitted) <= 5:
+                for filename in uncommitted:
+                    logger.info("  %s" % filename)
 
     # Confirmation prompt
     if args.yes:

@@ -20,6 +20,7 @@ no_ansi = False
 [submit]
 auto_submit = False
 always_blocking = False
+warn_uncommitted = True
 
 [updater]
 last_check = <time>
@@ -31,6 +32,8 @@ last_check = <time>
 - `submit.always_blocking` : when true reviewers in commit descriptions will be marked
     as blocking. reviewers specified on the command line override this setting
     (default: false).
+- `submit.warn_uncommiteed` : when true show a warning if there are uncommitted changes
+    in the working directory (default: true)
 - `updater.last_check` : epoch timestamp (local timezone) indicating the last time
     an update check was performed.
 
