@@ -391,6 +391,7 @@ class Repository(object):
 
     def check_commits_for_submit(self, commits):
         """Validate the list of commits (from commit_stack) are ok to submit"""
+        # TODO unit test
 
         errors = []
 
@@ -720,27 +721,36 @@ def augment_commits_from_body(commits):
     update_commit_summary_previews(commits)
 
 
-def update_commit_summary_previews(commits):
-    """Update summary-preview from commit metadata"""
-    for commit in commits:
-        # Reviewers.
-        summary = replace_reviewers(commit["summary"], commit["reviewers"])
+def build_commit_summary(commit):
+    """Build/update summary from commit metadata"""
+    # TODO unit test
 
-        # Bug-ID.
-        if commit["bug-id"]:
-            if BUG_ID_RE.search(summary):
-                summary = BUG_ID_RE.sub("Bug %s" % commit["bug-id"], summary)
-            else:
-                summary = "Bug %s - %s" % (commit["bug-id"], summary)
+    # Reviewers.
+    summary = replace_reviewers(commit["summary"], commit["reviewers"])
+
+    # Bug-ID.
+    if commit["bug-id"]:
+        if BUG_ID_RE.search(summary):
+            summary = BUG_ID_RE.sub("Bug %s" % commit["bug-id"], summary)
         else:
-            # This is likely to result in unappealing results.
-            summary = BUG_ID_RE.sub("", summary)
+            summary = "Bug %s - %s" % (commit["bug-id"], summary)
+    else:
+        # This is likely to result in unappealing results.
+        summary = BUG_ID_RE.sub("", summary)
 
-        commit["summary-preview"] = summary
+    return summary
+
+
+def update_commit_summary_previews(commits):
+    """Update summary-preview from commit metadata for all commits in stack"""
+    for commit in commits:
+        commit["summary-preview"] = build_commit_summary(commit)
 
 
 def replace_reviewers(commit_description, reviewers):
     """From vct's commitparser"""
+    # TODO unit test
+
     if not reviewers:
         reviewers_str = ""
     else:
@@ -809,6 +819,7 @@ def arc(args):
 
 def arc_message(template_vars):
     """Build arc commit desc message from the template"""
+    # TODO unit test
 
     # Map `None` to an empty string.
     for name in template_vars.keys():
@@ -830,6 +841,8 @@ def arc_message(template_vars):
 
 
 def update_commits_from_args(commits, args):
+    # TODO unit tests
+
     # Build list of reviewers from args.
     reviewers = list(set(args.reviewer)) if args.reviewer else []
     blockers = list(set(args.blocker)) if args.blocker else []
