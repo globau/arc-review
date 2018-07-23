@@ -45,6 +45,11 @@ import urllib2
 #   to address this we'll need to talk to phabricator directly to query the current
 #   stack, and clear dependencies prior to calling arc. we'd probably also have to
 #   abandon revisions that are no longer part of the stack.
+# - commits with a description already modified by arc (ie. the follow the arc commit
+#   description template with 'test plan', subscribers, etc) are not handled by this
+#   script.  commits in this format should be detected and result in the commit being
+#   rejected.  ideally this should extract the summary, body, reviewers, and bug-id
+#   from the arc template and reformat to the standard mozilla format.
 
 
 # Environment Vars
@@ -267,28 +272,23 @@ class Config(object):
             logger.debug("using default config %s.%s: %s" % (section, option, default))
             return default
 
+    def _set(self, section, option, value):
+        if not self._config.has_section(section):
+            self._config.add_section(section)
+        self._config.set(section, option, value)
+
     def write(self):
         if os.path.exists(self._filename):
             logger.debug("updating %s" % self._filename)
-
-            if not self._config.has_section("submit"):
-                self._config.add_section("submit")
-            self._config.set("submit", "auto_submit", self.auto_submit)
-
-            if not self._config.has_section("updater"):
-                self._config.add_section("updater")
-            self._config.set("updater", "last_check", self.updater_last_check)
+            self._set("submit", "auto_submit", self.auto_submit)
+            self._set("updater", "last_check", self.updater_last_check)
 
         else:
             logger.debug("creating %s" % self._filename)
-
-            self._config.add_section("ui")
-            self._config.set("ui", "no_ansi", self.no_ansi)
-
-            self._config.add_section("submit")
-            self._config.set("submit", "auto_submit", self.auto_submit)
-            self._config.set("submit", "always_blocking", self.always_blocking)
-            self._config.set("submit", "warn_uncommitted", self.warn_uncommitted)
+            self._set("ui", "no_ansi", self.no_ansi)
+            self._set("submit", "auto_submit", self.auto_submit)
+            self._set("submit", "always_blocking", self.always_blocking)
+            self._set("submit", "warn_uncommitted", self.warn_uncommitted)
 
         with open(self._filename, "w") as f:
             self._config.write(f)
@@ -300,6 +300,9 @@ class Config(object):
 
 
 def repo_from_args(args):
+    """Returns a Repository object from either args.path or the cwd"""
+
+    # This allows users to override the below sanity checks.
     if hasattr(args, "path") and args.path:
         repo_path = args.path
 
@@ -325,6 +328,7 @@ def repo_from_args(args):
                 "Not a repository (or any of the parent directories): .hg / .git"
             )
 
+    # `arc` only works out of the cwd.
     os.chdir(repo_path)
 
     repo = None
@@ -433,6 +437,8 @@ class Mercurial(Repository):
         self.revset = None
         self.strip_nodes = []
 
+        # Load hg config into hg_config.  We'll specify specific settings on
+        # the command line when calling hg; all other user settings are ignored.
         hg_config = {}
         for line in check_output(self.hg + ["config"], never_log=True):
             (name, value) = line.split("=", 1)
@@ -468,6 +474,8 @@ class Mercurial(Repository):
         os.environ["HGRCPATH"] = ""
 
     def cleanup(self):
+        # Remove the store of obsolescence markers; if the user doesn't have evolve
+        # installed mercurial will warn if this exists.
         if not self.use_evolve:
             try:
                 os.unlink(os.path.join(self.path, ".hg", "store", "obsstore"))
@@ -475,6 +483,8 @@ class Mercurial(Repository):
                 if e.errno != errno.ENOENT:
                     raise
 
+        # With the obsstore deleted the amended nodes are no longer hidden, so
+        # we need to strip them completely from the repo.
         for node in self.strip_nodes:
             check_call(self.hg + ["strip", "--no-backup", node])
 
@@ -517,12 +527,13 @@ class Mercurial(Repository):
     def set_args(self, args):
         super(Mercurial, self).set_args(args)
 
+        # Set the default start revision.
         if self.args.start_rev == "(auto)":
             start = "ancestors(.) and not public() and not obsolete()"
         else:
             start = self.args.start_rev
 
-        # resolve to nodes as that's nicer to read
+        # Resolve to nodes as that's nicer to read.
         try:
             start = self._hg_log(start)[0]
         except IndexError:
@@ -598,7 +609,7 @@ class Mercurial(Repository):
     def check_commits_for_submit(self, commits):
         nodes = [c["node"] for c in commits]
 
-        # Merge base should be included in the revset
+        # Merge base should be included in the revset.
         ancestor = self._hg_log("ancestor(%s)" % self.revset, split=False)
         if ancestor not in nodes:
             raise Error(
@@ -606,7 +617,7 @@ class Mercurial(Repository):
                 % ancestor[:12]
             )
 
-        # Merge base needs to have a public parent
+        # Merge base needs to have a public parent.
         parent_phases = check_output(
             self.hg + ["log", "-T", "{phase} {node}\n", "-r", "parents(%s)" % ancestor]
         )
@@ -617,12 +628,12 @@ class Mercurial(Repository):
                     "%s is based off non-public commit %s" % (ancestor[:12], node[:12])
                 )
 
-        # Can't submit merge requests
+        # Can't submit merge requests.
         if self._hg_log("%s and merge()" % self.revset):
             raise Error("Commit stack contains a merge commit")
 
         for commit in commits:
-            # Follow each branch on the DAG ensuring only one has our nodes
+            # Follow each branch on the DAG ensuring only one has our nodes.
             children = self._hg_log("children(%s)" % commit["node"])
             found = False
             for child in children:
@@ -747,7 +758,7 @@ def replace_reviewers(commit_description, reviewers):
     else:
         # replace the first r? with the reviewer list, and all subsequent
         # occurrences with a marker to mark the blocks we need to remove
-        # later
+        # later.
         d = {"first": True}
 
         def replace_first_reviewer(matchobj):
@@ -789,6 +800,7 @@ def show_commit_stack(commits, show_rev_urls=False, show_warnings=False):
 
 
 def arc(args):
+    """arc wrapper that logs output"""
     arc_output = check_output(ARC + args, split=False)
     if logger.level != logging.DEBUG:
         logger.info(arc_output)
@@ -796,12 +808,14 @@ def arc(args):
 
 
 def arc_message(template_vars):
-    # Map `None` to an empty string
+    """Build arc commit desc message from the template"""
+
+    # Map `None` to an empty string.
     for name in template_vars.keys():
         if template_vars[name] is None:
             template_vars[name] = ""
 
-    # `depends_on` is optional
+    # `depends_on` is optional.
     if "depends_on" not in template_vars:
         template_vars["depends_on"] = ""
 
@@ -840,7 +854,7 @@ def submit(repo, args):
     if DEBUG or (hasattr(args, "trace") and args.trace):
         ARC.append("--trace")
 
-    # Find and preview commits to submit
+    # Find and preview commits to submits.
     commits = repo.commit_stack()
     if not commits:
         raise Error("Failed to find any commits to submit")
@@ -848,11 +862,11 @@ def submit(repo, args):
         "Submitting %s commit%s:" % (len(commits), "" if len(commits) == 1 else "s")
     )
 
-    # Pre-Process to load metadata
+    # Pre-process to load metadata.
     augment_commits_from_body(commits)
     update_commits_from_args(commits, args)
 
-    # Validate commit stack is suitable for review
+    # Validate commit stack is suitable for review.
     show_commit_stack(commits, show_warnings=True)
     try:
         repo.check_commits_for_submit(commits)
@@ -861,7 +875,7 @@ def submit(repo, args):
             raise Error("Unable to submit commits:\n\n%s" % e)
         logger.error("Ignoring issues found with commits:\n\n%s" % e)
 
-    # Show a warning if there are uncommitted files
+    # Show a warning if there are uncommitted files.
     if config.warn_uncommitted:
         uncommitted = repo.uncommitted()
         if uncommitted:
@@ -873,7 +887,7 @@ def submit(repo, args):
                 for filename in uncommitted:
                     logger.info("  %s" % filename)
 
-    # Confirmation prompt
+    # Confirmation prompt.
     if args.yes:
         pass
     elif config.auto_submit and not args.interactive:
@@ -891,15 +905,17 @@ def submit(repo, args):
             config.auto_submit = True
             config.write()
 
-    # Process
+    # Process.
     previous_commit = None
     rebase_onto = None
     for commit in commits:
+        # The remainder of a stack is orphaned when a commit is amended; rebase.
         if rebase_onto:
             repo.rebase_commit(commit, rebase_onto)
             repo.refresh_commit_stack(commits)
             rebase_onto = None
 
+        # Let the user know something's happening.
         if commit["rev-id"]:
             logger.info("\nUpdating revision D%s:" % commit["rev-id"])
         else:
@@ -907,7 +923,7 @@ def submit(repo, args):
         logger.info("%s %s" % (commit["name"], commit["summary-preview"]))
         repo.checkout(commit["node"])
 
-        # Create arc-annotated commit description
+        # Create arc-annotated commit description.
         template_vars = dict(
             summary=commit["summary-preview"],
             body=commit["body"],
@@ -918,7 +934,7 @@ def submit(repo, args):
             template_vars["depends_on"] = "Depends on D%s" % previous_commit["rev-id"]
         message = arc_message(template_vars)
 
-        # Run arc
+        # Run arc.
         with tempfile.NamedTemporaryFile() as temp_f:
             temp_f.write(message)
             temp_f.flush()
@@ -937,19 +953,20 @@ def submit(repo, args):
 
             arc_output = arc(arc_args)
 
-        # Extract Revision URL
+        # Extract Revision URL.
         m = ARC_REV_URL_RE.search(arc_output)
         if not m:
             raise Error("Failed to find 'Revision URL' in arc output")
         revision_url = m.group(1)
 
-        # Append/replace div rev url to/in commit description
+        # Append/replace div rev url to/in commit description.
         body = commit["body"]
         body = ARC_DIFF_REV_RE.sub("", body).rstrip()
         if body:
             body += "\n"
         body += "\nDifferential Revision: %s" % revision_url
 
+        # Amend the commit if required.
         if commit["summary-preview"] != commit["summary"] or body != commit["body"]:
             commit["summary"] = commit["summary-preview"]
             commit["body"] = body
@@ -969,17 +986,20 @@ def submit(repo, args):
 
 
 def get_self_release():
+    """Queries github for the most recent release's tag and timestamp"""
     releases_api_url = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
     logger.debug("fetching %s" % releases_api_url)
 
+    # Grab release json from github's api, using a very short timeout.
     try:
-        release = json.load(urllib2.urlopen(releases_api_url))
+        release = json.load(urllib2.urlopen(releases_api_url, timeout=5))
     except (urllib2.HTTPError, urllib2.URLError) as e:
         raise Error("Failed to check for updates: %s" % e)
     except ValueError:
         raise Error("Malformed response from GitHub when checking for updates")
     logger.debug(release)
 
+    # Grab the published and last-modified timestamps.
     published_at = parse_zulu_time(release["published_at"])
     try:
         m_time = os.path.getmtime(SELF_FILE)
@@ -998,10 +1018,12 @@ def get_self_release():
 
 
 def check_self_update():
+    """Log a message if an update is required/available"""
     if IS_DEV:
         logger.debug("skipping self-update check in development mode")
         return
 
+    # We don't want to spam the user about updates.
     if time.time() - config.updater_last_check < UPDATE_FREQUENCY * 60 * 60:
         logger.debug("update check not required")
         return
@@ -1017,6 +1039,7 @@ def check_self_update():
 
 
 def self_update(args):
+    """`self-update` command, downloads latest version from github and update"""
     release = get_self_release()
 
     if not release["update_required"] and not args.force:
@@ -1124,7 +1147,7 @@ def parse_args():
         help="End revision of range to submit (default: current commit)",
     )
 
-    # arc informs users to pass --trace for more output, so we need to accept it
+    # arc informs users to pass --trace for more output, so we need to accept it.
     submit_parser.add_argument("--trace", action="store_true", help=argparse.SUPPRESS)
 
     submit_parser.set_defaults(func=submit, needs_repo=True)
