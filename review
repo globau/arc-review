@@ -1034,7 +1034,10 @@ def check_for_updates():
         return
 
     # Notify for self updates.
-    if time.time() - config.self_last_check > SELF_UPDATE_FREQUENCY * 60 * 60:
+    if (
+        config.self_last_check >= 0
+        and time.time() - config.self_last_check > SELF_UPDATE_FREQUENCY * 60 * 60
+    ):
         config.self_last_check = int(time.time())
         config.write()
 
@@ -1047,7 +1050,10 @@ def check_for_updates():
             logger.debug("update check not required")
 
     # Update arc.
-    if time.time() - config.arc_last_check > ARC_UPDATE_FREQUENCY * 60 * 60:
+    if (
+        config.arc_last_check >= 0
+        and time.time() - config.arc_last_check > ARC_UPDATE_FREQUENCY * 60 * 60
+    ):
         config.arc_last_check = int(time.time())
         config.write()
 

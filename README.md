@@ -36,9 +36,9 @@ arc_last_check = <time>
 - `submit.warn_uncommiteed` : when true show a warning if there are uncommitted changes
     in the working directory (default: true)
 - `updater.self_last_check` : epoch timestamp (local timezone) indicating the last time
-    an update check was performed for this script.
+    an update check was performed for this script.  set to `-1` to disable this check.
 - `updater.arc_last_check` : epoch timestamp (local timezone) indicating the last time
-    an update was performed for arc.
+    an update was performed for arc.  set to `-1` to disable this check.
 
 `review` can also be configured via the following environmental variables:
 - `IS_DEV` : connect to phabricator dev instance (default: connect to production)
