@@ -23,7 +23,8 @@ always_blocking = False
 warn_uncommitted = True
 
 [updater]
-last_check = <time>
+self_last_check = <time>
+arc_last_check = <time>
 ```
 
 - `ui.no_ansi` : never use ANSI colours (default: auto-detected).
@@ -34,8 +35,10 @@ last_check = <time>
     (default: false).
 - `submit.warn_uncommiteed` : when true show a warning if there are uncommitted changes
     in the working directory (default: true)
-- `updater.last_check` : epoch timestamp (local timezone) indicating the last time
-    an update check was performed.
+- `updater.self_last_check` : epoch timestamp (local timezone) indicating the last time
+    an update check was performed for this script.
+- `updater.arc_last_check` : epoch timestamp (local timezone) indicating the last time
+    an update was performed for arc.
 
 `review` can also be configured via the following environmental variables:
 - `IS_DEV` : connect to phabricator dev instance (default: connect to production)

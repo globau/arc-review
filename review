@@ -74,8 +74,9 @@ GUIDE_URL = (
 )
 
 # Auto-update
-UPDATE_REPO = "globau/arc-review"
-UPDATE_FREQUENCY = 72  # hours
+SELF_REPO = "globau/arc-review"
+SELF_UPDATE_FREQUENCY = 24 * 3  # hours
+ARC_UPDATE_FREQUENCY = 24 * 7  # hours
 
 # URL to post to.
 PHABIRCATOR_PROD_URL = "https://phabricator.services.mozilla.com/"
@@ -249,7 +250,8 @@ class Config(object):
         self.auto_submit = self._get_boolean("submit", "auto_submit", False)
         self.always_blocking = self._get_boolean("submit", "always_blocking", False)
         self.warn_uncommitted = self._get_boolean("submit", "warn_uncommitted", True)
-        self.updater_last_check = self._get_int("updater", "last_check", 0)
+        self.self_last_check = self._get_int("updater", "self_last_check", 0)
+        self.arc_last_check = self._get_int("updater", "arc_last_check", 0)
 
         if not os.path.exists(self._filename):
             self.write()
@@ -281,7 +283,8 @@ class Config(object):
         if os.path.exists(self._filename):
             logger.debug("updating %s" % self._filename)
             self._set("submit", "auto_submit", self.auto_submit)
-            self._set("updater", "last_check", self.updater_last_check)
+            self._set("updater", "self_last_check", self.self_last_check)
+            self._set("updater", "arc_last_check", self.arc_last_check)
 
         else:
             logger.debug("creating %s" % self._filename)
@@ -391,8 +394,6 @@ class Repository(object):
 
     def check_commits_for_submit(self, commits):
         """Validate the list of commits (from commit_stack) are ok to submit"""
-        # TODO unit test
-
         errors = []
 
         for commit in commits:
@@ -723,7 +724,6 @@ def augment_commits_from_body(commits):
 
 def build_commit_summary(commit):
     """Build/update summary from commit metadata"""
-    # TODO unit test
 
     # Reviewers.
     summary = replace_reviewers(commit["summary"], commit["reviewers"])
@@ -819,7 +819,6 @@ def arc(args):
 
 def arc_message(template_vars):
     """Build arc commit desc message from the template"""
-    # TODO unit test
 
     # Map `None` to an empty string.
     for name in template_vars.keys():
@@ -841,8 +840,6 @@ def arc_message(template_vars):
 
 
 def update_commits_from_args(commits, args):
-    # TODO unit tests
-
     # Build list of reviewers from args.
     reviewers = list(set(args.reviewer)) if args.reviewer else []
     blockers = list(set(args.blocker)) if args.blocker else []
@@ -1000,7 +997,7 @@ def submit(repo, args):
 
 def get_self_release():
     """Queries github for the most recent release's tag and timestamp"""
-    releases_api_url = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
+    releases_api_url = "https://api.github.com/repos/%s/releases/latest" % SELF_REPO
     logger.debug("fetching %s" % releases_api_url)
 
     # Grab release json from github's api, using a very short timeout.
@@ -1030,41 +1027,46 @@ def get_self_release():
     )
 
 
-def check_self_update():
+def check_for_updates():
     """Log a message if an update is required/available"""
     if IS_DEV:
-        logger.debug("skipping self-update check in development mode")
+        logger.debug("skipping update checks in development mode")
         return
 
-    # We don't want to spam the user about updates.
-    if time.time() - config.updater_last_check < UPDATE_FREQUENCY * 60 * 60:
-        logger.debug("update check not required")
-        return
-    config.updater_last_check = int(time.time())
-    config.write()
+    # Notify for self updates.
+    if time.time() - config.self_last_check > SELF_UPDATE_FREQUENCY * 60 * 60:
+        config.self_last_check = int(time.time())
+        config.write()
 
-    release = get_self_release()
-    if not release["update_required"]:
-        return
+        release = get_self_release()
 
-    logger.warning("Version %s of `review` is now available" % release["tag"])
-    logger.info("Run `review self-update` to update")
+        if release["update_required"]:
+            logger.warning("Version %s of `review` is now available" % release["tag"])
+            logger.info("Run `review self-update` to update")
+        else:
+            logger.debug("update check not required")
+
+    # Update arc.
+    if time.time() - config.arc_last_check > ARC_UPDATE_FREQUENCY * 60 * 60:
+        config.arc_last_check = int(time.time())
+        config.write()
+
+        check_call(["arc", "upgrade"])
 
 
 def self_update(args):
-    """`self-update` command, downloads latest version from github and update"""
+    """`self-update` command, updates arc and this script"""
     release = get_self_release()
 
+    check_call(["arc", "upgrade"])
+
     if not release["update_required"] and not args.force:
-        logger.warning("Update not required")
+        logger.warning("Update of `review` not required")
         return
 
-    logger.warning("Updating to v%s" % release["tag"])
+    logger.warning("Updating `review` to v%s" % release["tag"])
 
-    url = "https://raw.githubusercontent.com/%s/%s/review" % (
-        UPDATE_REPO,
-        release["tag"],
-    )
+    url = "https://raw.githubusercontent.com/%s/%s/review" % (SELF_REPO, release["tag"])
     logger.debug("updating '%s' from %s" % (SELF_FILE, url))
     try:
         gh = urllib2.urlopen(url)
@@ -1195,7 +1197,7 @@ def main():
         args = parse_args()
 
         if args.command != "self-update":
-            check_self_update()
+            check_for_updates()
 
         if args.needs_repo:
             repo = repo_from_args(args)
