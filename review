@@ -191,6 +191,24 @@ def check_output(command, split=True, never_log=False):
     return output.splitlines() if split else output
 
 
+def read_json_field(filename, field_path):
+    """Parses json file returning value as per field_path, or None."""
+    try:
+        with open(filename) as f:
+            rc = json.load(f)
+            for field_name in field_path:
+                if field_name not in rc:
+                    return None
+                rc = rc[field_name]
+            return rc
+    except IOError as e:
+        if e.errno == errno.ENOENT:
+            return None
+        raise
+    except ValueError:
+        return None
+
+
 def prompt(question, options):
     if HAS_ANSI:
         question = "\033[33m%s\033[0m" % question
@@ -353,39 +371,35 @@ def repo_from_args(args):
 
 
 class Repository(object):
-    def __init__(self, path):
+    def __init__(self, path, dot_path):
         self.path = path
+        self.dot_path = dot_path
         self.args = None
         self.phab_url = self._phab_url()
 
     def _phab_url(self):
         """Determine the phab/conduit URL."""
 
-        # .arcconfig in repo root
-        try:
-            with open(os.path.join(self.path, ".arcconfig")) as f:
-                rc = json.load(f)
-                if "phabricator.uri" in rc:
-                    return rc["phabricator.uri"]
-        except IOError as e:
-            if e.errno == errno.ENOENT:
-                pass
-        except ValueError:
-            pass
+        # TODO windows - env[APPDATA]/.arcrc
+        # TODO windows - env[ProgramData]/Phabricator/Arcanist/config
 
-        # User's .arcrc
-        try:
-            with open(os.path.join(os.path.expanduser("~"), ".arcrc")) as f:
-                rc = json.load(f).get("config")
-                if rc and "default" in rc:
-                    return rc["default"]
-        except IOError as e:
-            if e.errno == errno.ENOENT:
-                pass
-        except ValueError:
-            pass
+        # In order of priority as per arc
+        phab_url = (
+            read_json_field(
+                os.path.join(self.dot_path, ".arcconfig"), ["phabricator.uri"]
+            )
+            or read_json_field(
+                os.path.join(self.path, ".arcconfig"), ["phabricator.uri"]
+            )
+            or read_json_field("/etc/arcconfig", ["config", "default"])
+            or read_json_field(
+                os.path.join(os.path.expanduser("~"), ".arcrc"), ["config", "default"]
+            )
+        )
 
-        raise Error("Failed to find .arcconfig or ~/.arcrc")
+        if not phab_url:
+            raise Error("Failed to determine Phabricator URL (missing .arcconfig?)")
+        return phab_url
 
     def cleanup(self):
         """Perform any repo-related cleanup tasks."""
@@ -457,9 +471,10 @@ class Repository(object):
 
 class Mercurial(Repository):
     def __init__(self, path):
-        super(Mercurial, self).__init__(path)
+        dot_path = os.path.join(path, ".hg")
+        super(Mercurial, self).__init__(path, dot_path)
 
-        if not os.path.exists(os.path.join(path, ".hg")):
+        if not os.path.exists(self.dot_path):
             raise ValueError("%s: not a hg repository" % path)
         if not which("hg"):
             raise Error("Failed to find 'hg' executable")
@@ -690,9 +705,10 @@ class Mercurial(Repository):
 
 class Git(Repository):
     def __init__(self, path):
-        super(Git, self).__init__(path)
+        dot_path = os.path.join(path, ".git")
+        super(Git, self).__init__(path, dot_path)
 
-        if not os.path.exists(os.path.join(path, ".git")):
+        if not os.path.exists(self.dot_path):
             raise ValueError("%s: not a git repository" % path)
         if not which("git"):
             raise Error("Failed to find 'git' executable")
@@ -985,6 +1001,7 @@ def submit(repo, args):
 
             arc_args = (
                 ["diff"]
+                + ["--base", "arc:this"]
                 + ["--allow-untracked", "--no-amend", "--no-ansi"]
                 + ["--message-file", temp_f.name]
             )
