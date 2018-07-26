@@ -44,18 +44,18 @@ import urllib2
 #   correctly on phabricator, or may outright fail due to dependency loops.
 #   to address this we'll need to talk to phabricator directly to query the current
 #   stack, and clear dependencies prior to calling arc. we'd probably also have to
-#   abandon revisions that are no longer part of the stack.
+#   abandon revisions that are no longer part of the stack.  unfortunately
+#   phabricator's api currently doesn't expose calls to do this.
 # - commits with a description already modified by arc (ie. the follow the arc commit
 #   description template with 'test plan', subscribers, etc) are not handled by this
 #   script.  commits in this format should be detected and result in the commit being
-#   rejected.  ideally this should extract the summary, body, reviewers, and bug-id
+#   rejected.  ideally this should extract the title, body, reviewers, and bug-id
 #   from the arc template and reformat to the standard mozilla format.
 
 
 # Environment Vars
 
 DEBUG = bool(os.getenv("DEBUG"))
-IS_DEV = bool(os.getenv("IS_DEV"))
 HAS_ANSI = (
     (hasattr(sys.stdout, "isatty") and sys.stdout.isatty())
     or os.getenv("TERM", "") == "ANSI"
@@ -78,22 +78,23 @@ SELF_REPO = "globau/arc-review"
 SELF_UPDATE_FREQUENCY = 24 * 3  # hours
 ARC_UPDATE_FREQUENCY = 24 * 7  # hours
 
-# URL to post to.
-PHABIRCATOR_PROD_URL = "https://phabricator.services.mozilla.com/"
-PHABIRCATOR_DEV_URL = "https://phabricator-dev.allizom.org/"
-PHABIRCATOR_URL = PHABIRCATOR_DEV_URL if IS_DEV else PHABIRCATOR_PROD_URL
+# Environment names (display purposes only)
+PHABRICATOR_URLS = {
+    "https://phabricator.services.mozilla.com/": "Phabricator",
+    "https://phabricator-dev.allizom.org/": "Phabricator-Dev",
+}
 
 # arc related consts.
 ARC = ["arc"]
 ARC_COMMIT_DESC_TEMPLATE = """
-{summary}
+{title}
 
 Summary:
 {body}
 
-Test Plan:
-
 {depends_on}
+
+Test Plan:
 
 Reviewers: {reviewers}
 
@@ -355,6 +356,36 @@ class Repository(object):
     def __init__(self, path):
         self.path = path
         self.args = None
+        self.phab_url = self._phab_url()
+
+    def _phab_url(self):
+        """Determine the phab/conduit URL."""
+
+        # .arcconfig in repo root
+        try:
+            with open(os.path.join(self.path, ".arcconfig")) as f:
+                rc = json.load(f)
+                if "phabricator.uri" in rc:
+                    return rc["phabricator.uri"]
+        except IOError as e:
+            if e.errno == errno.ENOENT:
+                pass
+        except ValueError:
+            pass
+
+        # User's .arcrc
+        try:
+            with open(os.path.join(os.path.expanduser("~"), ".arcrc")) as f:
+                rc = json.load(f).get("config")
+                if rc and "default" in rc:
+                    return rc["default"]
+        except IOError as e:
+            if e.errno == errno.ENOENT:
+                pass
+        except ValueError:
+            pass
+
+        raise Error("Failed to find .arcconfig or ~/.arcrc")
 
     def cleanup(self):
         """Perform any repo-related cleanup tasks."""
@@ -367,15 +398,15 @@ class Repository(object):
 
     def commit_stack(self):
         """Return list of commits - dicts with the following keys:
-            name            human readable identifier of commit (eg. short sha)
-            node            sha/hash
-            summary         first line of commit description (unaltered)
-            body            commit description, excluding first line
-            summary-preview summary with bug-id and reviewer modifications
-            bug-id          bmo bug-id
-            bug-id-orig     original bug-id from commit desc
-            reviewers       list of reviewers
-            rev-id          phabricator revision id
+            name          human readable identifier of commit (eg. short sha)
+            node          sha/hash
+            title         first line of commit description (unaltered)
+            body          commit description, excluding first line
+            title-preview title with bug-id and reviewer modifications
+            bug-id        bmo bug-id
+            bug-id-orig   original bug-id from commit desc
+            reviewers     list of reviewers
+            rev-id        phabricator revision id
         """
 
     def refresh_commit_stack(self, commits):
@@ -390,7 +421,7 @@ class Repository(object):
         update was required."""
 
     def rebase_commit(self, source_commit, dest_commit):
-        """Rebase."""
+        """Rebase source onto destination."""
 
     def check_commits_for_submit(self, commits):
         """Validate the list of commits (from commit_stack) are ok to submit"""
@@ -412,7 +443,7 @@ class Repository(object):
             if commit_errors:
                 errors.append(
                     "%s %s\n- %s"
-                    % (commit["name"], commit["summary"], "\n- ".join(commit_errors))
+                    % (commit["name"], commit["title"], "\n- ".join(commit_errors))
                 )
 
         if errors:
@@ -462,12 +493,14 @@ class Mercurial(Repository):
             self.hg.extend(["--config", "extensions.evolve="])
             self.use_evolve = True
 
-        # Otherwise just enable obsolescence markers, and remove the obsstore
-        # when we're done.
+        # Otherwise just enable obsolescence markers, and when we're done remove
+        # the obsstore we created.
         else:
             self.hg.extend(["--config", "experimental.evolution.createmarkers=true"])
             self.hg.extend(["--config", "extensions.strip="])
             self.use_evolve = False
+            self.obsstore = os.path.join(self.path, ".hg", "store", "obsstore")
+            self.unlink_obsstore = not os.path.exists(self.obsstore)
 
         # Shorter graphs are nicer
         self.hg.extend(["--config", "experimental.graphshorten=true"])
@@ -478,9 +511,9 @@ class Mercurial(Repository):
     def cleanup(self):
         # Remove the store of obsolescence markers; if the user doesn't have evolve
         # installed mercurial will warn if this exists.
-        if not self.use_evolve:
+        if not self.use_evolve and self.unlink_obsstore:
             try:
-                os.unlink(os.path.join(self.path, ".hg", "store", "obsstore"))
+                os.unlink(self.obsstore)
             except OSError as e:
                 if e.errno != errno.ENOENT:
                     raise
@@ -558,13 +591,13 @@ class Mercurial(Repository):
 
         commits = []
         for log_line in hg_log:
-            (rev, node, summary) = log_line.split(" ", 2)
+            (rev, node, title) = log_line.split(" ", 2)
             commits.append(
                 {
                     "name": "%s:%s" % (rev, node[:12]),
                     "node": node,
-                    "summary": summary,
-                    "summary-preview": summary,
+                    "title": title,
+                    "title-preview": title,
                     "body": "",
                     "bug-id": None,
                     "reviewers": [],
@@ -580,7 +613,7 @@ class Mercurial(Repository):
         check_call(self.hg + ["update", "--quiet", node])
 
     def amend_commit(self, commit):
-        current_body = "%s\n%s" % (commit["summary"], commit["body"])
+        current_body = "%s\n%s" % (commit["title"], commit["body"])
         repo_body = check_output(
             self.hg + ["log", "-T", "{desc}", "-r", commit["node"]], split=False
         )
@@ -611,7 +644,7 @@ class Mercurial(Repository):
     def check_commits_for_submit(self, commits):
         nodes = [c["node"] for c in commits]
 
-        # Merge base should be included in the revset.
+        # 'Greatest Common Ancestor'/'Merge Base' should be included in the revset.
         ancestor = self._hg_log("ancestor(%s)" % self.revset, split=False)
         if ancestor not in nodes:
             raise Error(
@@ -680,13 +713,13 @@ def parse_arc_diff_rev(body):
     return m.group(1) if m else None
 
 
-def parse_bugs(summary):
-    return BUG_ID_RE.findall(summary)
+def parse_bugs(title):
+    return BUG_ID_RE.findall(title)
 
 
-def parse_reviewers(summary):
+def parse_reviewers(title):
     reviewers = []
-    for match in re.finditer(REVIEWERS_RE, summary):
+    for match in re.finditer(REVIEWERS_RE, title):
         if not match.group(3):
             continue
         reviewers.extend(re.split(LIST_RE, match.group(3)))
@@ -699,6 +732,7 @@ def has_arc_rejections(body):
 
 def augment_commits_from_body(commits):
     """Extract metadata from commit body as fields.
+
     Adds: rev-id, bug-id, reviewers
     """
 
@@ -706,7 +740,7 @@ def augment_commits_from_body(commits):
         commit["rev-id"] = parse_arc_diff_rev(commit["body"])
 
         # bug-id
-        bug_ids = parse_bugs(commit["summary"])
+        bug_ids = parse_bugs(commit["title"])
         if bug_ids:
             if len(bug_ids) > 1:
                 logger.warning("Multiple bug-IDs found, using %s" % bug_ids[0])
@@ -717,34 +751,34 @@ def augment_commits_from_body(commits):
             commit["bug-id-orig"] = commit["bug-id"]
 
         # reviewers
-        commit["reviewers"] = parse_reviewers(commit["summary"])
+        commit["reviewers"] = parse_reviewers(commit["title"])
 
-    update_commit_summary_previews(commits)
+    update_commit_title_previews(commits)
 
 
-def build_commit_summary(commit):
-    """Build/update summary from commit metadata"""
+def build_commit_title(commit):
+    """Build/update title from commit metadata"""
 
     # Reviewers.
-    summary = replace_reviewers(commit["summary"], commit["reviewers"])
+    title = replace_reviewers(commit["title"], commit["reviewers"])
 
     # Bug-ID.
     if commit["bug-id"]:
-        if BUG_ID_RE.search(summary):
-            summary = BUG_ID_RE.sub("Bug %s" % commit["bug-id"], summary)
+        if BUG_ID_RE.search(title):
+            title = BUG_ID_RE.sub("Bug %s" % commit["bug-id"], title)
         else:
-            summary = "Bug %s - %s" % (commit["bug-id"], summary)
+            title = "Bug %s - %s" % (commit["bug-id"], title)
     else:
         # This is likely to result in unappealing results.
-        summary = BUG_ID_RE.sub("", summary)
+        title = BUG_ID_RE.sub("", title)
 
-    return summary
+    return title
 
 
-def update_commit_summary_previews(commits):
-    """Update summary-preview from commit metadata for all commits in stack"""
+def update_commit_title_previews(commits):
+    """Update title-preview from commit metadata for all commits in stack"""
     for commit in commits:
-        commit["summary-preview"] = build_commit_summary(commit)
+        commit["title-preview"] = build_commit_title(commit)
 
 
 def replace_reviewers(commit_description, reviewers):
@@ -760,11 +794,11 @@ def replace_reviewers(commit_description, reviewers):
         return reviewers_str
 
     commit_description = commit_description.splitlines()
-    commit_summary = commit_description.pop(0)
+    commit_title = commit_description.pop(0)
     commit_description = "\n".join(commit_description)
 
-    if not R_SPECIFIER_RE.search(commit_summary):
-        commit_summary += " " + reviewers_str
+    if not R_SPECIFIER_RE.search(commit_title):
+        commit_title += " " + reviewers_str
     else:
         # replace the first r? with the reviewer list, and all subsequent
         # occurrences with a marker to mark the blocks we need to remove
@@ -781,24 +815,24 @@ def replace_reviewers(commit_description, reviewers):
             else:
                 return matchobj.group(0)
 
-        commit_summary = re.sub(REVIEWERS_RE, replace_first_reviewer, commit_summary)
+        commit_title = re.sub(REVIEWERS_RE, replace_first_reviewer, commit_title)
 
         # remove marker values as well as leading separators.  this allows us
         # to remove runs of multiple reviewers and retain the trailing
         # separator.
-        commit_summary = re.sub(LIST + "\0", "", commit_summary)
-        commit_summary = re.sub("\0", "", commit_summary)
+        commit_title = re.sub(LIST + "\0", "", commit_title)
+        commit_title = re.sub("\0", "", commit_title)
 
     if commit_description == "":
-        return commit_summary.strip()
+        return commit_title.strip()
     else:
-        return commit_summary.strip() + "\n" + commit_description
+        return commit_title.strip() + "\n" + commit_description
 
 
-def show_commit_stack(commits, show_rev_urls=False, show_warnings=False):
+def show_commit_stack(repo, commits, show_rev_urls=False, show_warnings=False):
     """Log the commit stack in a human readable form."""
     for commit in commits:
-        logger.info("%s %s" % (commit["name"], commit["summary-preview"]))
+        logger.info("%s %s" % (commit["name"], commit["title-preview"]))
         if show_warnings:
             if commit["bug-id-orig"] and commit["bug-id"] != commit["bug-id-orig"]:
                 logger.warning(
@@ -806,7 +840,7 @@ def show_commit_stack(commits, show_rev_urls=False, show_warnings=False):
                     % (commit["bug-id-orig"], commit["bug-id"])
                 )
         if show_rev_urls and commit["rev-id"]:
-            logger.warning("-> %sD%s" % (PHABIRCATOR_URL, commit["rev-id"]))
+            logger.warning("-> %sD%s" % (repo.phab_url, commit["rev-id"]))
 
 
 def arc(args):
@@ -857,7 +891,7 @@ def update_commits_from_args(commits, args):
         for commit in commits:
             commit["reviewers"] = ["%s!" % r.rstrip("!") for r in commit["reviewers"]]
 
-    update_commit_summary_previews(commits)
+    update_commit_title_previews(commits)
 
 
 def submit(repo, args):
@@ -877,7 +911,7 @@ def submit(repo, args):
     update_commits_from_args(commits, args)
 
     # Validate commit stack is suitable for review.
-    show_commit_stack(commits, show_warnings=True)
+    show_commit_stack(repo, commits, show_warnings=True)
     try:
         repo.check_commits_for_submit(commits)
     except Error as e:
@@ -906,7 +940,7 @@ def submit(repo, args):
         )
     else:
         res = prompt(
-            "Submit to Phabricator%s" % ("-dev" if IS_DEV else ""),
+            "Submit to %s" % PHABRICATOR_URLS.get(repo.phab_url, repo.phab_url),
             ["Yes", "No", "Always"],
         )
         if res == "No":
@@ -930,12 +964,12 @@ def submit(repo, args):
             logger.info("\nUpdating revision D%s:" % commit["rev-id"])
         else:
             logger.info("\nCreating new revision:")
-        logger.info("%s %s" % (commit["name"], commit["summary-preview"]))
+        logger.info("%s %s" % (commit["name"], commit["title-preview"]))
         repo.checkout(commit["node"])
 
         # Create arc-annotated commit description.
         template_vars = dict(
-            summary=commit["summary-preview"],
+            title=commit["title-preview"],
             body=commit["body"],
             reviewers=", ".join(commit["reviewers"]),
             bug_id=commit["bug-id"],
@@ -977,8 +1011,8 @@ def submit(repo, args):
         body += "\nDifferential Revision: %s" % revision_url
 
         # Amend the commit if required.
-        if commit["summary-preview"] != commit["summary"] or body != commit["body"]:
-            commit["summary"] = commit["summary-preview"]
+        if commit["title-preview"] != commit["title"] or body != commit["body"]:
+            commit["title"] = commit["title-preview"]
             commit["body"] = body
             repo.amend_commit(commit)
             repo.refresh_commit_stack(commits)
@@ -987,7 +1021,7 @@ def submit(repo, args):
         previous_commit = commit
 
     logger.warning("\nCompleted")
-    show_commit_stack(commits, show_rev_urls=True)
+    show_commit_stack(repo, commits, show_rev_urls=True)
 
 
 #
@@ -1029,9 +1063,6 @@ def get_self_release():
 
 def check_for_updates():
     """Log a message if an update is required/available"""
-    if IS_DEV:
-        logger.debug("skipping update checks in development mode")
-        return
 
     # Notify for self updates.
     if (
@@ -1090,21 +1121,23 @@ def self_update(args):
 #
 
 
-def colour_logger(logger_method, colour_code):
-    def wrapper(message, *args, **kwargs):
-        return logger_method(
-            "\033[%sm%s\033[0m" % (colour_code, message), *args, **kwargs
-        )
+class ColourFormatter(logging.Formatter):
+    def __init__(self):
+        super(ColourFormatter, self).__init__("%(message)s")
+        self.log_colours = {"WARNING": 34, "ERROR": 31}  # blue, red
 
-    return wrapper
+    def format(self, record):
+        if HAS_ANSI and record.levelname in self.log_colours:
+            record.msg = "\033[%sm%s\033[0m" % (
+                self.log_colours[record.levelname],
+                record.msg,
+            )
+        return super(ColourFormatter, self).format(record)
 
 
 def init_logging():
     stdout_handler = logging.StreamHandler(sys.stdout)
-    if HAS_ANSI:
-        setattr(logger, "warning", colour_logger(getattr(logger, "warning"), "34"))
-        setattr(logger, "error", colour_logger(getattr(logger, "error"), "31"))
-    stdout_handler.setFormatter(logging.Formatter("%(message)s"))
+    stdout_handler.setFormatter(ColourFormatter())
     logger.addHandler(stdout_handler)
     logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
 
@@ -1138,7 +1171,7 @@ def parse_args():
         "--force",
         "-f",
         action="store_true",
-        help="Force submission even if commit stack validation fails",
+        help="Override sanity checks and force submission; a tool of last resort",
     )
     submit_parser.add_argument("--bug", "-b", help="Set Bug ID for all commits")
     submit_parser.add_argument(

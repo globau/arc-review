@@ -41,7 +41,6 @@ arc_last_check = <time>
     an update was performed for arc.  set to `-1` to disable this check.
 
 `review` can also be configured via the following environmental variables:
-- `IS_DEV` : connect to phabricator dev instance (default: connect to production)
 - `DEBUG` : enabled debugging output (default: disabled)
 - `UPDATE_FILE` : when self-updating write to this file instead of \_\_file\_\_
 
