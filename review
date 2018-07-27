@@ -404,7 +404,8 @@ class Repository(object):
         return phab_url
 
     def cleanup(self):
-        """Perform any repo-related cleanup tasks."""
+        """Perform any repo-related cleanup tasks.  May be called multiple times.
+        If an exception is raised this is NOT called (to avoid dataloss)."""
 
     def set_args(self, args):
         self.args = args
@@ -533,10 +534,11 @@ class Mercurial(Repository):
                 if e.errno != errno.ENOENT:
                     raise
 
-        # With the obsstore deleted the amended nodes are no longer hidden, so
-        # we need to strip them completely from the repo.
-        for node in self.strip_nodes:
-            check_call(self.hg + ["strip", "--no-backup", node])
+        if self.strip_nodes:
+            # With the obsstore deleted the amended nodes are no longer hidden, so
+            # we need to strip them completely from the repo.
+            check_call(self.hg + ["strip", "--no-backup"] + self.strip_nodes)
+            self.strip_nodes = []
 
     def _hg_log(self, revset, split=True, select="node"):
         return check_output(
@@ -673,7 +675,13 @@ class Mercurial(Repository):
         # If there's no children we can just amend.
         if not first_child_node:
             self._amend_commit_body(commit["node"], updated_body)
-            self.strip_nodes.append(commit["node"])
+
+            # This should always result in an amended node, but we need to be
+            # extra careful not to strip the original node.
+            amended_node = self._hg_log("tip", split=False)
+            if amended_node != commit["node"]:
+                self.strip_nodes.append(commit["node"])
+
             return
 
         # Brace yourself.  We need to create a dummy commit with the same parent as
@@ -921,7 +929,7 @@ def replace_reviewers(commit_description, reviewers):
 
 def show_commit_stack(repo, commits, show_rev_urls=False, show_warnings=False):
     """Log the commit stack in a human readable form."""
-    for commit in commits:
+    for commit in reversed(commits):
         logger.info("%s %s" % (commit["name"], commit["title-preview"]))
         if show_warnings:
             if commit["bug-id-orig"] and commit["bug-id"] != commit["bug-id-orig"]:
@@ -1111,6 +1119,11 @@ def submit(repo, args):
             rebase_onto = commit
 
         previous_commit = commit
+
+    # Cleanup (eg. strip nodes) and refresh to ensure the stack is right for the
+    # final showing.
+    repo.cleanup()
+    repo.refresh_commit_stack(commits)
 
     logger.warning("\nCompleted")
     show_commit_stack(repo, commits, show_rev_urls=True)
@@ -1332,10 +1345,8 @@ def main():
 
         if args.needs_repo:
             repo = repo_from_args(args)
-            try:
-                args.func(repo, args)
-            finally:
-                repo.cleanup()
+            args.func(repo, args)
+            repo.cleanup()
 
         else:
             args.func(args)
