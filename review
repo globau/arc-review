@@ -3,6 +3,8 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+# coding=utf-8
+
 """
 Wrapper around Phabricator's `arc` cli to support submission of a series of commits.
 
@@ -425,14 +427,12 @@ class Repository(object):
 
     def refresh_commit_stack(self, commits):
         """Update the stack following an altering change (eg rebase)."""
-        augment_commits_from_body(commits)
 
     def checkout(self, node):
         """Checkout/Update to specified node."""
 
-    def amend_commit(self, commit):
-        """Amend commit description from `desc` field; return bool indicating if
-        update was required."""
+    def amend_commit(self, commit, commits):
+        """Amend commit description from `title` and `desc` fields"""
 
     def rebase_commit(self, source_commit, dest_commit):
         """Rebase source onto destination."""
@@ -548,6 +548,13 @@ class Mercurial(Repository):
             self.hg + ["status", "--unknown", "-T", "{path}\n"], split=True
         )
 
+    def _refresh_commit(self, commit, node, rev=None):
+        """Update commit's node and name from node and rev."""
+        if not rev:
+            rev = self._hg_log(node, select="rev", split=False)
+        commit["node"] = node
+        commit["name"] = "%s:%s" % (rev, node[:12])
+
     def refresh_commit_stack(self, commits):
         """Update all commits to point to their superseded commit."""
         for commit in commits:
@@ -567,8 +574,7 @@ class Mercurial(Repository):
                     )
 
                 (rev, node) = hg_log[0].split(" ", 1)
-                commit["node"] = node
-                commit["name"] = "%s:%s" % (rev, node[:12])
+                self._refresh_commit(commit, node, rev)
 
         self.revset = "%s::%s" % (commits[0]["node"], commits[-1]["node"])
 
@@ -627,26 +633,94 @@ class Mercurial(Repository):
     def checkout(self, node):
         check_call(self.hg + ["update", "--quiet", node])
 
-    def amend_commit(self, commit):
-        current_body = "%s\n%s" % (commit["title"], commit["body"])
-        repo_body = check_output(
-            self.hg + ["log", "-T", "{desc}", "-r", commit["node"]], split=False
-        )
-        if repo_body == current_body:
-            logger.debug("not amending commit %s, unchanged" % commit["name"])
-            return
-
+    def _amend_commit_body(self, node, body):
         with tempfile.NamedTemporaryFile() as temp_f:
-            temp_f.write(current_body)
+            temp_f.write(body)
             temp_f.flush()
 
-            self.checkout(commit["node"])
+            self.checkout(node)
             check_call(self.hg + ["commit", "--amend", "--logfile", temp_f.name])
 
-        # If we don't have evolve we need to strip the commit, otherwise it will
-        # "reappear" when we remove the obsstore.
-        if not self.use_evolve:
+    def amend_commit(self, commit, commits):
+        updated_body = "%s\n%s" % (commit["title"], commit["body"])
+        current_body = check_output(
+            self.hg + ["log", "-T", "{desc}", "-r", commit["node"]], split=False
+        )
+        if current_body == updated_body:
+            logger.debug("not amending commit %s, unchanged" % commit["name"])
+            return False
+
+        # If evolve is installed this is trivial.
+        if self.use_evolve:
+            self._amend_commit_body(commit["node"], updated_body)
+            return
+
+        # Without evolve things are much more exciting.
+
+        # Find our position in the stack.
+        parent_node = None
+        first_child_node = None
+        is_parent = True
+        for c in commits:
+            if c["node"] == commit["node"]:
+                is_parent = False
+            elif is_parent:
+                parent_node = c["node"]
+            elif not first_child_node:
+                first_child_node = c["node"]
+                break
+
+        # If there's no children we can just amend.
+        if not first_child_node:
+            self._amend_commit_body(commit["node"], updated_body)
             self.strip_nodes.append(commit["node"])
+            return
+
+        # Brace yourself.  We need to create a dummy commit with the same parent as
+        # the commit, rebase a copy of the commit onto the dummy, amend, rebase the
+        # amended commit back onto the original parent, rebase the children onto the
+        # then strip the original commit and dummy commits.
+
+        # Find a parent for the first commit in the stack
+        if not parent_node:
+            parent_node = self._hg_log("parents(%s)" % commit["node"])[0]
+
+        # Create the dummy commit.
+        self.checkout(parent_node)
+        check_call(
+            self.hg
+            + ["commit"]
+            + ["--message", "dummy"]
+            + ["--config", "ui.allowemptycommit=true"]
+        )
+        dummy_node = self._hg_log("tip", split=False)
+
+        # Rebase a copy of this commit onto the dummy.
+        check_call(
+            self.hg
+            + ["rebase"]
+            + ["--keep"]
+            + ["--rev", commit["node"]]
+            + ["--dest", dummy_node]
+        )
+        rebased_node = self._hg_log("tip", split=False)
+
+        # Amend.
+        self._amend_commit_body(rebased_node, updated_body)
+        amended_node = self._hg_log("tip", split=False)
+
+        # Rebase back onto parent
+        check_call(
+            self.hg + ["rebase"] + ["--source", amended_node] + ["--dest", parent_node]
+        )
+        rebased_amended_node = self._hg_log("tip", split=False)
+
+        # Update the commit object now.
+        original_node = commit["node"]
+        self._refresh_commit(commit, rebased_amended_node)
+
+        # Note what nodes need to be stripped when we're all done.
+        self.strip_nodes.extend([original_node, dummy_node])
 
     def rebase_commit(self, source_commit, dest_commit):
         check_call(
@@ -971,6 +1045,7 @@ def submit(repo, args):
     for commit in commits:
         # The remainder of a stack is orphaned when a commit is amended; rebase.
         if rebase_onto:
+            # TODO move this into amend_commit
             repo.rebase_commit(commit, rebase_onto)
             repo.refresh_commit_stack(commits)
             rebase_onto = None
@@ -1031,7 +1106,7 @@ def submit(repo, args):
         if commit["title-preview"] != commit["title"] or body != commit["body"]:
             commit["title"] = commit["title-preview"]
             commit["body"] = body
-            repo.amend_commit(commit)
+            repo.amend_commit(commit, commits)
             repo.refresh_commit_stack(commits)
             rebase_onto = commit
 
