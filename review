@@ -652,28 +652,36 @@ class Mercurial(Repository):
             logger.debug("not amending commit %s, unchanged" % commit["name"])
             return False
 
-        # If evolve is installed this is trivial.
-        if self.use_evolve:
-            self._amend_commit_body(commit["node"], updated_body)
-            return
-
-        # Without evolve things are much more exciting.
-
         # Find our position in the stack.
         parent_node = None
-        first_child_node = None
+        first_child = None
         is_parent = True
         for c in commits:
             if c["node"] == commit["node"]:
                 is_parent = False
             elif is_parent:
                 parent_node = c["node"]
-            elif not first_child_node:
-                first_child_node = c["node"]
+            elif not first_child:
+                first_child = c
                 break
 
+        # If evolve is installed this is trivial.
+        if self.use_evolve:
+            # Amend and refresh the stack to get the new commit node.
+            self._amend_commit_body(commit["node"], updated_body)
+            self.refresh_commit_stack(commits)
+
+            # Rebase children atop new commit node.
+            if first_child:
+                self.rebase_commit(first_child, commit)
+                self.refresh_commit_stack(commits)
+
+            return
+
+        # Without evolve things are much more exciting.
+
         # If there's no children we can just amend.
-        if not first_child_node:
+        if not first_child:
             self._amend_commit_body(commit["node"], updated_body)
 
             # This should always result in an amended node, but we need to be
@@ -682,6 +690,7 @@ class Mercurial(Repository):
             if amended_node != commit["node"]:
                 self.strip_nodes.append(commit["node"])
 
+            self.refresh_commit_stack(commits)
             return
 
         # Brace yourself.  We need to create a dummy commit with the same parent as
@@ -729,6 +738,10 @@ class Mercurial(Repository):
 
         # Note what nodes need to be stripped when we're all done.
         self.strip_nodes.extend([original_node, dummy_node])
+
+        # And rebase children.
+        self.rebase_commit(first_child, commit)
+        self.refresh_commit_stack(commits)
 
     def rebase_commit(self, source_commit, dest_commit):
         check_call(
@@ -1049,15 +1062,7 @@ def submit(repo, args):
 
     # Process.
     previous_commit = None
-    rebase_onto = None
     for commit in commits:
-        # The remainder of a stack is orphaned when a commit is amended; rebase.
-        if rebase_onto:
-            # TODO move this into amend_commit
-            repo.rebase_commit(commit, rebase_onto)
-            repo.refresh_commit_stack(commits)
-            rebase_onto = None
-
         # Let the user know something's happening.
         if commit["rev-id"]:
             logger.info("\nUpdating revision D%s:" % commit["rev-id"])
@@ -1115,8 +1120,6 @@ def submit(repo, args):
             commit["title"] = commit["title-preview"]
             commit["body"] = body
             repo.amend_commit(commit, commits)
-            repo.refresh_commit_stack(commits)
-            rebase_onto = commit
 
         previous_commit = commit
 
