@@ -22,9 +22,9 @@ import errno
 import io
 import json
 import logging
-import ssl
 import os
 import re
+import ssl
 import stat
 import subprocess
 import sys
