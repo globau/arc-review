@@ -113,7 +113,7 @@ class CommitParsing(unittest.TestCase):
             ),
         )
 
-    def test_arc_diff_dev(self):
+    def test_arc_diff_rev(self):
         parse = review.parse_arc_diff_rev
 
         self.assertEqual("1", parse("Differential Revision: https://example.com/D1"))

@@ -49,3 +49,5 @@ e.g. To enable debugging output on MacOS/Linux:
   $ DEBUG=1 review submit
 ```
 
+Unit tests can be executed with `python -m unittest discover`.
+

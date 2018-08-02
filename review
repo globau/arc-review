@@ -19,8 +19,10 @@ import argparse
 import calendar
 import datetime
 import errno
+import io
 import json
 import logging
+import ssl
 import os
 import re
 import stat
@@ -32,14 +34,7 @@ import time
 import traceback
 import tty
 import urllib2
-
-# MVP
-# TODO unit tests
-
-# v1.0
-# TODO windows
-# TODO Git support
-# TODO python3
+from distutils.version import LooseVersion
 
 # Known Issues
 # - reordering, folding, etc commits doesn't result in the stack being updated
@@ -72,7 +67,7 @@ config = None
 
 # Where to direct people when `arc` isn't installed.
 GUIDE_URL = (
-    "http://moz-conduit.readthedocs.io/en/latest/phabricator-user.html#quick-start"
+    "https://moz-conduit.readthedocs.io/en/latest/phabricator-user.html#quick-start"
 )
 
 # Auto-update
@@ -104,7 +99,7 @@ Subscribers:
 
 Bug #: {bug_id}
 """.strip()
-ARC_REV_URL_RE = re.compile(r"^\s*Revision URI: (http.+)$", flags=re.MULTILINE)
+ARC_OUTPUT_REV_URL_RE = re.compile(r"^\s*Revision URI: (http.+)$", flags=re.MULTILINE)
 ARC_DIFF_REV_RE = re.compile(
     r"^\s*Differential Revision:\s*https://.+/D(\d+)\s*$", flags=re.MULTILINE
 )
@@ -135,6 +130,7 @@ REVIEWERS_RE = re.compile(
 )
 R_SPECIFIER_RE = re.compile(r"\br[=?]")
 
+MINIMUM_MERCURIAL_VERSION = LooseVersion("4.3.3")
 
 #
 # Utilities
@@ -174,17 +170,17 @@ def parse_zulu_time(timestamp):
     return calendar.timegm(time.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ"))
 
 
-def check_call(command, *args):
+def check_call(command, **kwargs):
     # wrapper around subprocess.check_call with debug output
     logger.debug("$ %s" % " ".join(shell_quote(s) for s in command))
-    subprocess.check_call(command, *args)
+    subprocess.check_call(command, **kwargs)
 
 
-def check_output(command, split=True, never_log=False):
+def check_output(command, cwd=None, split=True, never_log=False):
     # wrapper around subprocess.check_output with debug output and splitting
     logger.debug("$ %s" % " ".join(shell_quote(s) for s in command))
     try:
-        output = subprocess.check_output(command).rstrip()
+        output = subprocess.check_output(command, cwd=cwd).rstrip()
     except subprocess.CalledProcessError as e:
         logger.debug(e.output)
         raise Exception("command '%s' failed to complete successfully" % command[0])
@@ -224,18 +220,21 @@ def prompt(question, options):
     default = options[0][0].lower()
     options = {o[0].lower(): o for o in options}
     try:
+        # Put terminal into raw mode to allow us to capture a single char immediately.
         old_term_attrs = termios.tcgetattr(fd)
         try:
             tty.setraw(sys.stdin.fileno())
         except termios.error:
             pass
+
         while res not in options:
             res = sys.stdin.read(1).lower()
-            if res == chr(13):
+            if res == chr(13):  # return
                 res = default
-            elif res == chr(3) or res == chr(27):
+            elif res == chr(3) or res == chr(27):  # ^C, escape
                 sys.exit(1)
     except termios.error:
+        # Fallback on readline() if we failed to put the terminal into raw mode.
         while res not in options:
             res = sys.stdin.readline().strip().lower()
             if len(res) > 1:
@@ -252,7 +251,7 @@ def prompt(question, options):
 
 
 class Error(Exception):
-    """Errors throw explictly by this script; won't generate a stack trace."""
+    """Errors thrown explictly by this script; won't generate a stack trace."""
 
 
 #
@@ -263,42 +262,43 @@ class Error(Exception):
 class Config(object):
     def __init__(self):
         self._filename = os.path.join(os.path.expanduser("~"), ".review-config")
-        self._config = ConfigParser.ConfigParser()
-        self._config.read([self._filename])
         self.name = "~/.review-config"  # human-readable name
 
-        self.no_ansi = self._get_boolean("ui", "no_ansi", False)
-        self.auto_submit = self._get_boolean("submit", "auto_submit", False)
-        self.always_blocking = self._get_boolean("submit", "always_blocking", False)
-        self.warn_uncommitted = self._get_boolean("submit", "warn_uncommitted", True)
-        self.self_last_check = self._get_int("updater", "self_last_check", 0)
-        self.arc_last_check = self._get_int("updater", "arc_last_check", 0)
+        # Default values.
+        defaults = u"""
+            [ui]
+            no_ansi=false
+
+            [submit]
+            auto_submit=false
+            always_blocking=false
+            warn_uncommitted=true
+
+            [updater]
+            self_last_check=0
+            arc_last_check=0
+            """
+
+        self._config = ConfigParser.SafeConfigParser()
+        self._config.readfp(
+            io.StringIO("\n".join([l.strip() for l in defaults.splitlines()]))
+        )
+        self._config.read([self._filename])
+
+        self.no_ansi = self._config.getboolean("ui", "no_ansi")
+        self.auto_submit = self._config.getboolean("submit", "auto_submit")
+        self.always_blocking = self._config.getboolean("submit", "always_blocking")
+        self.warn_uncommitted = self._config.getboolean("submit", "warn_uncommitted")
+        self.self_last_check = self._config.getint("updater", "self_last_check")
+        self.arc_last_check = self._config.getint("updater", "arc_last_check")
 
         if not os.path.exists(self._filename):
             self.write()
 
-    def _get_boolean(self, section, option, default):
-        try:
-            value = self._config.getboolean(section, option)
-            logger.debug("read config %s.%s: %s" % (section, option, value))
-            return value
-        except (ValueError, ConfigParser.NoSectionError, ConfigParser.NoOptionError):
-            logger.debug("using default config %s.%s: %s" % (section, option, default))
-            return default
-
-    def _get_int(self, section, option, default):
-        try:
-            value = self._config.getint(section, option)
-            logger.debug("read config %s.%s: %s" % (section, option, value))
-            return value
-        except (ValueError, ConfigParser.NoSectionError, ConfigParser.NoOptionError):
-            logger.debug("using default config %s.%s: %s" % (section, option, default))
-            return default
-
     def _set(self, section, option, value):
         if not self._config.has_section(section):
             self._config.add_section(section)
-        self._config.set(section, option, value)
+        self._config.set(section, option, str(value))
 
     def write(self):
         if os.path.exists(self._filename):
@@ -323,67 +323,55 @@ class Config(object):
 #
 
 
+def probe_repo(path):
+    try:
+        return Mercurial(path)
+    except ValueError:
+        pass
+
+    try:
+        return Git(path)
+    except ValueError:
+        pass
+
+    return None
+
+
 def repo_from_args(args):
     """Returns a Repository object from either args.path or the cwd"""
 
+    repo = None
+
     # This allows users to override the below sanity checks.
     if hasattr(args, "path") and args.path:
-        repo_path = args.path
+        repo = probe_repo(args.path)
+        if not repo:
+            raise Error("%s: Not a repository: .hg / .git" % args.path)
 
     else:
         # Walk parents to find repository root.
-        repo_path = None
         path = os.path.abspath(os.getcwd())
-        while True:
-            if os.path.exists(os.path.join(path, ".hg")) or os.path.exists(
-                os.path.join(path, ".git")
-            ):
-                if repo_path:
-                    raise Error(
-                        "Nested repositories are not supported:\n%s\n%s\n"
-                        "Specify a path using --path" % (repo_path, path)
-                    )
-                repo_path = path
-            if not os.path.split(path)[1]:
-                break
+        while not repo and os.path.split(path)[1]:
+            repo = probe_repo(path)
             path = os.path.abspath(os.path.join(path, os.path.pardir))
-        if not repo_path:
+        if not repo:
             raise Error(
                 "Not a repository (or any of the parent directories): .hg / .git"
             )
-
-    # `arc` only works out of the cwd.
-    os.chdir(repo_path)
-
-    repo = None
-    try:
-        repo = Mercurial(repo_path)
-    except ValueError:
-        pass
-    if not repo:
-        try:
-            repo = Git(repo_path)
-        except ValueError:
-            pass
-    if not repo:
-        raise Error("Failed to find Repository class for %s" % repo_path)
 
     repo.set_args(args)
     return repo
 
 
 class Repository(object):
-    def __init__(self, path, dot_path):
-        self.path = path
-        self.dot_path = dot_path
+    def __init__(self, path, dot_path, phab_url=None):
+        self.path = path  # base repository directory
+        self.dot_path = dot_path  # .hg/.git directory
         self.args = None
-        self.phab_url = self._phab_url()
+        self.phab_url = phab_url or self._phab_url()
 
     def _phab_url(self):
         """Determine the phab/conduit URL."""
-
-        # TODO windows - env[APPDATA]/.arcrc
-        # TODO windows - env[ProgramData]/Phabricator/Arcanist/config
 
         # In order of priority as per arc
         phab_url = (
@@ -404,7 +392,9 @@ class Repository(object):
         return phab_url
 
     def cleanup(self):
-        """Perform any repo-related cleanup tasks.  May be called multiple times.
+        """Perform any repo-related cleanup tasks.
+
+        May be called multiple times.
         If an exception is raised this is NOT called (to avoid dataloss)."""
 
     def set_args(self, args):
@@ -414,7 +404,9 @@ class Repository(object):
         """Return a list of uncommitted files."""
 
     def commit_stack(self):
-        """Return list of commits - dicts with the following keys:
+        """Return list of commits.
+
+        List of dicts with the following keys:
             name          human readable identifier of commit (eg. short sha)
             node          sha/hash
             title         first line of commit description (unaltered)
@@ -473,24 +465,36 @@ class Repository(object):
 class Mercurial(Repository):
     def __init__(self, path):
         dot_path = os.path.join(path, ".hg")
-        super(Mercurial, self).__init__(path, dot_path)
-
-        if not os.path.exists(self.dot_path):
+        if not os.path.exists(dot_path):
             raise ValueError("%s: not a hg repository" % path)
-        if not which("hg"):
-            raise Error("Failed to find 'hg' executable")
-
         logger.debug("found hg repo in %s" % path)
 
-        self.hg = ["hg"]
+        super(Mercurial, self).__init__(path, dot_path)
+
+        self._hg = ["hg"]
         self.revset = None
         self.strip_nodes = []
+
+        # Check for `hg`, and mercurial version.
+        if not which("hg"):
+            raise Error("Failed to find 'hg' executable")
+        m = re.search(
+            r"\(version ([^)]+)\)", self.hg_out(["--version", "--quiet"], split=False)
+        )
+        if not m:
+            raise Error("Failed to determine Mercurial version.")
+        if LooseVersion(m.group(1)) < MINIMUM_MERCURIAL_VERSION:
+            raise Error(
+                "You are currently running Mercurial %s.  "
+                "Mercurial %s or newer is required."
+                % (m.group(1), MINIMUM_MERCURIAL_VERSION)
+            )
 
         # Load hg config into hg_config.  We'll specify specific settings on
         # the command line when calling hg; all other user settings are ignored.
         hg_config = {}
-        for line in check_output(self.hg + ["config"], never_log=True):
-            (name, value) = line.split("=", 1)
+        for line in self.hg_out(["config"], never_log=True):
+            name, value = line.split("=", 1)
             name = name.strip()
             value = value.strip()
             if not name.startswith("extensions.") or not value.startswith("!"):
@@ -499,30 +503,43 @@ class Mercurial(Repository):
         # Need to use the correct username.
         if "ui.username" not in hg_config:
             raise Error("ui.username is not configured in your hgrc")
-        self.hg.extend(["--config", "ui.username=%s" % hg_config["ui.username"]])
+        self._hg.extend(["--config", "ui.username=%s" % hg_config["ui.username"]])
 
         # Always need rebase.
-        self.hg.extend(["--config", "extensions.rebase="])
+        self._hg.extend(["--config", "extensions.rebase="])
 
-        # Enable evolve if the user's currently using it.
+        # Enable evolve if the user's currently using it.  evolve makes amending
+        # commits with children trivial (amongst other things).
         if "extensions.evolve" in hg_config:
-            self.hg.extend(["--config", "extensions.evolve="])
+            self._hg.extend(
+                ["--config", "extensions.evolve=%s" % hg_config["extensions.evolve"]]
+            )
             self.use_evolve = True
 
         # Otherwise just enable obsolescence markers, and when we're done remove
         # the obsstore we created.
         else:
-            self.hg.extend(["--config", "experimental.evolution.createmarkers=true"])
-            self.hg.extend(["--config", "extensions.strip="])
+            self._hg.extend(["--config", "experimental.evolution.createmarkers=true"])
+            self._hg.extend(["--config", "extensions.strip="])
             self.use_evolve = False
             self.obsstore = os.path.join(self.path, ".hg", "store", "obsstore")
             self.unlink_obsstore = not os.path.exists(self.obsstore)
 
-        # Shorter graphs are nicer
-        self.hg.extend(["--config", "experimental.graphshorten=true"])
-
         # Disable the user's hgrc file, to ensure we run without rogue extensions.
         os.environ["HGRCPATH"] = ""
+
+        # Normalise/standardise Mercurial's output.
+        os.environ["HGPLAIN"] = "1"
+        os.environ["HGENCODING"] = "UTF-8"
+
+    def hg(self, command, **kwargs):
+        return check_call(self._hg + command, cwd=self.path, **kwargs)
+
+    def hg_out(self, command, **kwargs):
+        return check_output(self._hg + command, cwd=self.path, **kwargs)
+
+    def hg_log(self, revset, split=True, select="node"):
+        return self.hg_out(["log", "-T", "{%s}\n" % select, "-r", revset], split=split)
 
     def cleanup(self):
         # Remove the store of obsolescence markers; if the user doesn't have evolve
@@ -537,32 +554,24 @@ class Mercurial(Repository):
         if self.strip_nodes:
             # With the obsstore deleted the amended nodes are no longer hidden, so
             # we need to strip them completely from the repo.
-            check_call(self.hg + ["strip", "--no-backup"] + self.strip_nodes)
+            self.hg(["strip"] + self.strip_nodes)
             self.strip_nodes = []
 
-    def _hg_log(self, revset, split=True, select="node"):
-        return check_output(
-            self.hg + ["log", "-T", "{%s}\n" % select, "-r", revset], split=split
-        )
-
     def uncommitted(self):
-        return check_output(
-            self.hg + ["status", "--unknown", "-T", "{path}\n"], split=True
-        )
+        return self.hg_out(["status", "--unknown", "-T", "{path}\n"], split=True)
 
     def _refresh_commit(self, commit, node, rev=None):
         """Update commit's node and name from node and rev."""
         if not rev:
-            rev = self._hg_log(node, select="rev", split=False)
+            rev = self.hg_log(node, select="rev", split=False)
         commit["node"] = node
         commit["name"] = "%s:%s" % (rev, node[:12])
 
     def refresh_commit_stack(self, commits):
         """Update all commits to point to their superseded commit."""
         for commit in commits:
-            hg_log = check_output(
-                self.hg
-                + ["log"]
+            hg_log = self.hg_out(
+                ["log"]
                 + ["-T", "{rev} {node}\n"]
                 + ["--hidden"]
                 + ["-r", "successors(%s) and not obsolete()" % commit["node"]]
@@ -593,23 +602,22 @@ class Mercurial(Repository):
 
         # Resolve to nodes as that's nicer to read.
         try:
-            start = self._hg_log(start)[0]
+            start = self.hg_log(start)[0]
         except IndexError:
             if self.args.start_rev == "(auto)":
                 raise Error("Failed to find draft commits to submit")
             else:
                 raise Error("Failed to start of commit range: %s" % self.args.start_rev)
         try:
-            end = self._hg_log(self.args.end_rev)[0]
+            end = self.hg_log(self.args.end_rev)[0]
         except IndexError:
             raise Error("Failed to end of commit range: %s" % self.args.end_rev)
 
         self.revset = "%s::%s" % (start[:12], end[:12])
 
     def commit_stack(self):
-        hg_log = check_output(
-            self.hg
-            + ["log", "-T", "{rev} {node} {desc|firstline}\n", "-r", self.revset]
+        hg_log = self.hg_out(
+            ["log", "-T", "{rev} {node} {desc|firstline}\n", "-r", self.revset]
         )
 
         commits = []
@@ -627,13 +635,13 @@ class Mercurial(Repository):
                     "rev-id": None,
                 }
             )
-            body = check_output(self.hg + ["log", "-T", "{desc}", "-r", node])
+            body = self.hg_out(["log", "-T", "{desc}", "-r", node])
             commits[-1]["body"] = "\n".join(body[1:]).rstrip()
 
         return commits
 
     def checkout(self, node):
-        check_call(self.hg + ["update", "--quiet", node])
+        self.hg(["update", "--quiet", node])
 
     def _amend_commit_body(self, node, body):
         with tempfile.NamedTemporaryFile() as temp_f:
@@ -641,12 +649,12 @@ class Mercurial(Repository):
             temp_f.flush()
 
             self.checkout(node)
-            check_call(self.hg + ["commit", "--amend", "--logfile", temp_f.name])
+            self.hg(["commit", "--amend", "--logfile", temp_f.name])
 
     def amend_commit(self, commit, commits):
         updated_body = "%s\n%s" % (commit["title"], commit["body"])
-        current_body = check_output(
-            self.hg + ["log", "-T", "{desc}", "-r", commit["node"]], split=False
+        current_body = self.hg_out(
+            ["log", "-T", "{desc}", "-r", commit["node"]], split=False
         )
         if current_body == updated_body:
             logger.debug("not amending commit %s, unchanged" % commit["name"])
@@ -665,8 +673,14 @@ class Mercurial(Repository):
                 first_child = c
                 break
 
-        # If evolve is installed this is trivial.
+        # Track children of the last commit in the stack.
+        post_stack_children = []
+        if not first_child:
+            post_stack_children = self.hg_log("children(%s)" % commit["node"])
+
         if self.use_evolve:
+            # If evolve is installed this is trivial.
+
             # Amend and refresh the stack to get the new commit node.
             self._amend_commit_body(commit["node"], updated_body)
             self.refresh_commit_stack(commits)
@@ -674,79 +688,72 @@ class Mercurial(Repository):
             # Rebase children atop new commit node.
             if first_child:
                 self.rebase_commit(first_child, commit)
-                self.refresh_commit_stack(commits)
 
-            return
+        elif not first_child and not post_stack_children:
+            # Without evolve things are much more exciting.
 
-        # Without evolve things are much more exciting.
+            # If there's no children we can just amend.
 
-        # If there's no children we can just amend.
-        if not first_child:
             self._amend_commit_body(commit["node"], updated_body)
 
             # This should always result in an amended node, but we need to be
             # extra careful not to strip the original node.
-            amended_node = self._hg_log("tip", split=False)
+            amended_node = self.hg_log("tip", split=False)
             if amended_node != commit["node"]:
                 self.strip_nodes.append(commit["node"])
 
-            self.refresh_commit_stack(commits)
-            return
+        else:
+            # Brace yourself.  We need to create a dummy commit with the same parent as
+            # the commit, rebase a copy of the commit onto the dummy, amend, rebase the
+            # amended commit back onto the original parent, rebase the children onto
+            # that, then strip the original commit and dummy commits.
 
-        # Brace yourself.  We need to create a dummy commit with the same parent as
-        # the commit, rebase a copy of the commit onto the dummy, amend, rebase the
-        # amended commit back onto the original parent, rebase the children onto the
-        # then strip the original commit and dummy commits.
+            # Find a parent for the first commit in the stack
+            if not parent_node:
+                parent_node = self.hg_log("parents(%s)" % commit["node"])[0]
 
-        # Find a parent for the first commit in the stack
-        if not parent_node:
-            parent_node = self._hg_log("parents(%s)" % commit["node"])[0]
+            # Create the dummy commit.
+            self.checkout(parent_node)
+            self.hg(
+                ["commit"]
+                + ["--message", "dummy"]
+                + ["--config", "ui.allowemptycommit=true"]
+            )
+            dummy_node = self.hg_log("tip", split=False)
 
-        # Create the dummy commit.
-        self.checkout(parent_node)
-        check_call(
-            self.hg
-            + ["commit"]
-            + ["--message", "dummy"]
-            + ["--config", "ui.allowemptycommit=true"]
-        )
-        dummy_node = self._hg_log("tip", split=False)
+            # Rebase a copy of this commit onto the dummy.
+            self.hg(["rebase", "--keep", "--rev", commit["node"], "--dest", dummy_node])
+            rebased_node = self.hg_log("tip", split=False)
 
-        # Rebase a copy of this commit onto the dummy.
-        check_call(
-            self.hg
-            + ["rebase"]
-            + ["--keep"]
-            + ["--rev", commit["node"]]
-            + ["--dest", dummy_node]
-        )
-        rebased_node = self._hg_log("tip", split=False)
+            # Amend.
+            self._amend_commit_body(rebased_node, updated_body)
+            amended_node = self.hg_log("tip", split=False)
 
-        # Amend.
-        self._amend_commit_body(rebased_node, updated_body)
-        amended_node = self._hg_log("tip", split=False)
+            # Rebase back onto parent
+            self.hg(["rebase"] + ["--source", amended_node] + ["--dest", parent_node])
+            rebased_amended_node = self.hg_log("tip", split=False)
 
-        # Rebase back onto parent
-        check_call(
-            self.hg + ["rebase"] + ["--source", amended_node] + ["--dest", parent_node]
-        )
-        rebased_amended_node = self._hg_log("tip", split=False)
+            # Update the commit object now.
+            original_node = commit["node"]
+            self._refresh_commit(commit, rebased_amended_node)
 
-        # Update the commit object now.
-        original_node = commit["node"]
-        self._refresh_commit(commit, rebased_amended_node)
+            # Note what nodes need to be stripped when we're all done.
+            self.strip_nodes.extend([original_node, dummy_node])
 
-        # Note what nodes need to be stripped when we're all done.
-        self.strip_nodes.extend([original_node, dummy_node])
+            # And rebase children.
+            if first_child:
+                self.rebase_commit(first_child, commit)
 
-        # And rebase children.
-        self.rebase_commit(first_child, commit)
+        # Ensure our view of the stack is up to date.
         self.refresh_commit_stack(commits)
 
+        # Commits that are descendants of the stack need to be rebased too.
+        for node in post_stack_children:
+            self.hg(["rebase", "--source", node, "--dest", commit["node"]])
+
     def rebase_commit(self, source_commit, dest_commit):
-        check_call(
-            self.hg
-            + ["rebase"]
+        self.hg(
+            ["rebase"]
             + ["--source", source_commit["node"]]
             + ["--dest", dest_commit["node"]]
         )
@@ -755,7 +762,7 @@ class Mercurial(Repository):
         nodes = [c["node"] for c in commits]
 
         # 'Greatest Common Ancestor'/'Merge Base' should be included in the revset.
-        ancestor = self._hg_log("ancestor(%s)" % self.revset, split=False)
+        ancestor = self.hg_log("ancestor(%s)" % self.revset, split=False)
         if ancestor not in nodes:
             raise Error(
                 "Non-linear commit stack (common ancestor %s missing from stack)"
@@ -763,8 +770,8 @@ class Mercurial(Repository):
             )
 
         # Merge base needs to have a public parent.
-        parent_phases = check_output(
-            self.hg + ["log", "-T", "{phase} {node}\n", "-r", "parents(%s)" % ancestor]
+        parent_phases = self.hg_out(
+            ["log", "-T", "{phase} {node}\n", "-r", "parents(%s)" % ancestor]
         )
         for parent in parent_phases:
             (phase, node) = parent.split(" ", 1)
@@ -774,15 +781,15 @@ class Mercurial(Repository):
                 )
 
         # Can't submit merge requests.
-        if self._hg_log("%s and merge()" % self.revset):
+        if self.hg_log("%s and merge()" % self.revset):
             raise Error("Commit stack contains a merge commit")
 
         for commit in commits:
             # Follow each branch on the DAG ensuring only one has our nodes.
-            children = self._hg_log("children(%s)" % commit["node"])
+            children = self.hg_log("children(%s)" % commit["node"])
             found = False
             for child in children:
-                descendants = self._hg_log(
+                descendants = self.hg_log(
                     "descendants(%s) and %s" % (child, self.revset)
                 )
                 if len(descendants):
@@ -801,15 +808,15 @@ class Mercurial(Repository):
 class Git(Repository):
     def __init__(self, path):
         dot_path = os.path.join(path, ".git")
+        if not os.path.exists(dot_path):
+            raise ValueError("%s: not a git repository" % path)
+        logger.debug("found git repo in %s" % path)
+
         super(Git, self).__init__(path, dot_path)
 
-        if not os.path.exists(self.dot_path):
-            raise ValueError("%s: not a git repository" % path)
         if not which("git"):
             raise Error("Failed to find 'git' executable")
         # TODO draw the rest of the owl
-
-        logger.debug("found git repo in %s" % path)
 
         raise NotImplementedError("git support is not yet implemented")
 
@@ -954,9 +961,9 @@ def show_commit_stack(repo, commits, show_rev_urls=False, show_warnings=False):
             logger.warning("-> %sD%s" % (repo.phab_url, commit["rev-id"]))
 
 
-def arc(args):
+def arc_out(args, cwd):
     """arc wrapper that logs output"""
-    arc_output = check_output(ARC + args, split=False)
+    arc_output = check_output(ARC + args, cwd=cwd, split=False)
     if logger.level != logging.DEBUG:
         logger.info(arc_output)
     return arc_output
@@ -1100,10 +1107,10 @@ def submit(repo, args):
             else:
                 arc_args.append("--create")
 
-            arc_output = arc(arc_args)
+            arc_output = arc_out(arc_args, cwd=repo.path)
 
         # Extract Revision URL.
-        m = ARC_REV_URL_RE.search(arc_output)
+        m = ARC_OUTPUT_REV_URL_RE.search(arc_output)
         if not m:
             raise Error("Failed to find 'Revision URL' in arc output")
         revision_url = m.group(1)
@@ -1119,6 +1126,7 @@ def submit(repo, args):
         if commit["title-preview"] != commit["title"] or body != commit["body"]:
             commit["title"] = commit["title-preview"]
             commit["body"] = body
+            commit["rev-id"] = parse_arc_diff_rev(commit["body"])
             repo.amend_commit(commit, commits)
 
         previous_commit = commit
@@ -1196,14 +1204,14 @@ def check_for_updates():
         config.arc_last_check = int(time.time())
         config.write()
 
-        check_call(["arc", "upgrade"])
+        check_call(ARC + ["upgrade"])
 
 
 def self_update(args):
     """`self-update` command, updates arc and this script"""
     release = get_self_release()
 
-    check_call(["arc", "upgrade"])
+    check_call(ARC + ["upgrade"])
 
     if not release["update_required"] and not args.force:
         logger.warning("Update of `review` not required")
@@ -1235,12 +1243,10 @@ class ColourFormatter(logging.Formatter):
         self.log_colours = {"WARNING": 34, "ERROR": 31}  # blue, red
 
     def format(self, record):
+        result = super(ColourFormatter, self).format(record)
         if HAS_ANSI and record.levelname in self.log_colours:
-            record.msg = "\033[%sm%s\033[0m" % (
-                self.log_colours[record.levelname],
-                record.msg,
-            )
-        return super(ColourFormatter, self).format(record)
+            result = "\033[%sm%s\033[0m" % (self.log_colours[record.levelname], result)
+        return result
 
 
 def init_logging():
@@ -1341,6 +1347,16 @@ def main():
                 "%s" % GUIDE_URL
             )
 
+        # Ensure ssl certificates are validated (see PEP 476).
+        if hasattr(ssl, "_https_verify_certificates"):
+            # PEP 493: "private" API to configure HTTPS defaults without monkeypatching
+            # noinspection PyProtectedMember
+            ssl._https_verify_certificates()
+        else:
+            logger.warning("Your version of Python does not validate HTTPS "
+                           "certificates.  Please consider upgrading to Python 2.7.9 "
+                           "or later.")
+
         args = parse_args()
 
         if args.command != "self-update":
@@ -1358,10 +1374,12 @@ def main():
         pass
     except Error as e:
         logger.error(e)
+        sys.exit(1)
     except Exception as e:
         logger.error(
             traceback.format_exc() if DEBUG else "%s: %s" % (e.__class__.__name__, e)
         )
+        sys.exit(1)
 
 
 if __name__ == "__main__":
