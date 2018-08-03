@@ -177,14 +177,16 @@ def check_call(command, **kwargs):
     subprocess.check_call(command, **kwargs)
 
 
-def check_output(command, cwd=None, split=True, never_log=False):
+def check_output(command, cwd=None, split=True, strip=True, never_log=False):
     # wrapper around subprocess.check_output with debug output and splitting
     logger.debug("$ %s" % " ".join(shell_quote(s) for s in command))
     try:
-        output = subprocess.check_output(command, cwd=cwd).rstrip()
+        output = subprocess.check_output(command, cwd=cwd)
     except subprocess.CalledProcessError as e:
         logger.debug(e.output)
         raise Exception("command '%s' failed to complete successfully" % command[0])
+    if strip:
+        output = output.rstrip()
     if output and not never_log:
         logger.debug(output)
     return output.splitlines() if split else output
@@ -622,7 +624,8 @@ class Mercurial(Repository):
         hg_log = self.hg_out(
             ["log", "-T", "{rev} {node} {desc}%s" % boundary, "-r", self.revset],
             split=False,
-        ).rstrip(boundary)
+            strip=False,
+        )[: -len(boundary)]
 
         commits = []
         for log_line in hg_log.split(boundary):
@@ -727,7 +730,7 @@ class Mercurial(Repository):
 
             # Rebase a copy of this commit onto the dummy.
             self.hg(["rebase", "--keep", "--rev", commit["node"], "--dest", dummy_node])
-            rebased_node = self.hg_log(".", split=False)
+            rebased_node = self.hg_log("children(.)", split=False)
 
             # Amend.
             self._amend_commit_body(rebased_node, updated_body)
