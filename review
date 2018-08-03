@@ -34,6 +34,7 @@ import time
 import traceback
 import tty
 import urllib2
+import uuid
 from distutils.version import LooseVersion
 
 # Known Issues
@@ -616,27 +617,30 @@ class Mercurial(Repository):
         self.revset = "%s::%s" % (start[:12], end[:12])
 
     def commit_stack(self):
+        # Grab all the info we need about the commits, using randomness as a delimiter.
+        boundary = "--%s--\n" % uuid.uuid4().get_hex()
         hg_log = self.hg_out(
-            ["log", "-T", "{rev} {node} {desc|firstline}\n", "-r", self.revset]
-        )
+            ["log", "-T", "{rev} {node} {desc}%s" % boundary, "-r", self.revset],
+            split=False,
+        ).rstrip(boundary)
 
         commits = []
-        for log_line in hg_log:
-            (rev, node, title) = log_line.split(" ", 2)
+        for log_line in hg_log.split(boundary):
+            rev, node, desc = log_line.split(" ", 2)
+            desc = desc.splitlines()
+
             commits.append(
                 {
                     "name": "%s:%s" % (rev, node[:12]),
                     "node": node,
-                    "title": title,
-                    "title-preview": title,
-                    "body": "",
+                    "title": desc[0],
+                    "title-preview": desc[0],
+                    "body": "\n".join(desc[1:]).rstrip(),
                     "bug-id": None,
                     "reviewers": [],
                     "rev-id": None,
                 }
             )
-            body = self.hg_out(["log", "-T", "{desc}", "-r", node])
-            commits[-1]["body"] = "\n".join(body[1:]).rstrip()
 
         return commits
 
@@ -698,7 +702,7 @@ class Mercurial(Repository):
 
             # This should always result in an amended node, but we need to be
             # extra careful not to strip the original node.
-            amended_node = self.hg_log("tip", split=False)
+            amended_node = self.hg_log(".", split=False)
             if amended_node != commit["node"]:
                 self.strip_nodes.append(commit["node"])
 
@@ -719,19 +723,19 @@ class Mercurial(Repository):
                 + ["--message", "dummy"]
                 + ["--config", "ui.allowemptycommit=true"]
             )
-            dummy_node = self.hg_log("tip", split=False)
+            dummy_node = self.hg_log(".", split=False)
 
             # Rebase a copy of this commit onto the dummy.
             self.hg(["rebase", "--keep", "--rev", commit["node"], "--dest", dummy_node])
-            rebased_node = self.hg_log("tip", split=False)
+            rebased_node = self.hg_log(".", split=False)
 
             # Amend.
             self._amend_commit_body(rebased_node, updated_body)
-            amended_node = self.hg_log("tip", split=False)
+            amended_node = self.hg_log(".", split=False)
 
             # Rebase back onto parent
             self.hg(["rebase"] + ["--source", amended_node] + ["--dest", parent_node])
-            rebased_amended_node = self.hg_log("tip", split=False)
+            rebased_amended_node = self.hg_log(".", split=False)
 
             # Update the commit object now.
             original_node = commit["node"]
@@ -1353,9 +1357,11 @@ def main():
             # noinspection PyProtectedMember
             ssl._https_verify_certificates()
         else:
-            logger.warning("Your version of Python does not validate HTTPS "
-                           "certificates.  Please consider upgrading to Python 2.7.9 "
-                           "or later.")
+            logger.warning(
+                "Your version of Python does not validate HTTPS "
+                "certificates.  Please consider upgrading to Python 2.7.9 "
+                "or later."
+            )
 
         args = parse_args()
 
