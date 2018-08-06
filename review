@@ -40,8 +40,8 @@ from distutils.version import LooseVersion
 # Known Issues
 # - reordering, folding, etc commits doesn't result in the stack being updated
 #   correctly on phabricator, or may outright fail due to dependency loops.
-#   to address this we'll need to talk to phabricator directly to query the current
-#   stack, and clear dependencies prior to calling arc. we'd probably also have to
+#   to address this we'll need to query phabricator's api directly and clear
+#   dependencies prior to calling arc. we'd probably also have to
 #   abandon revisions that are no longer part of the stack.  unfortunately
 #   phabricator's api currently doesn't expose calls to do this.
 # - commits with a description already modified by arc (ie. the follow the arc commit
@@ -275,7 +275,7 @@ class Config(object):
             [submit]
             auto_submit=false
             always_blocking=false
-            warn_uncommitted=true
+            warn_untracked=true
 
             [updater]
             self_last_check=0
@@ -291,7 +291,7 @@ class Config(object):
         self.no_ansi = self._config.getboolean("ui", "no_ansi")
         self.auto_submit = self._config.getboolean("submit", "auto_submit")
         self.always_blocking = self._config.getboolean("submit", "always_blocking")
-        self.warn_uncommitted = self._config.getboolean("submit", "warn_uncommitted")
+        self.warn_untracked = self._config.getboolean("submit", "warn_untracked")
         self.self_last_check = self._config.getint("updater", "self_last_check")
         self.arc_last_check = self._config.getint("updater", "arc_last_check")
 
@@ -315,7 +315,7 @@ class Config(object):
             self._set("ui", "no_ansi", self.no_ansi)
             self._set("submit", "auto_submit", self.auto_submit)
             self._set("submit", "always_blocking", self.always_blocking)
-            self._set("submit", "warn_uncommitted", self.warn_uncommitted)
+            self._set("submit", "warn_untracked", self.warn_untracked)
 
         with open(self._filename, "w") as f:
             self._config.write(f)
@@ -403,8 +403,8 @@ class Repository(object):
     def set_args(self, args):
         self.args = args
 
-    def uncommitted(self):
-        """Return a list of uncommitted files."""
+    def untracked(self):
+        """Return a list of untracked files."""
 
     def commit_stack(self):
         """Return list of commits.
@@ -477,6 +477,7 @@ class Mercurial(Repository):
         self._hg = ["hg"]
         self.revset = None
         self.strip_nodes = []
+        self.status = None
 
         # Check for `hg`, and mercurial version.
         if not which("hg"):
@@ -528,6 +529,17 @@ class Mercurial(Repository):
             self.obsstore = os.path.join(self.path, ".hg", "store", "obsstore")
             self.unlink_obsstore = not os.path.exists(self.obsstore)
 
+        # This script interacts poorly with mq.
+        self.has_mq = "extensions.mq" in hg_config
+        if self.has_mq:
+            self._hg.extend(
+                ["--config", "extensions.mq=%s" % hg_config["extensions.mq"]]
+            )
+
+        # `shelve` is useful for dealing with uncommitted changes; track if it's
+        # currently enabled so we can tailor our error accordingly.
+        self.has_shelve = "extensions.shelve" in hg_config
+
         # Disable the user's hgrc file, to ensure we run without rogue extensions.
         os.environ["HGRCPATH"] = ""
 
@@ -560,8 +572,21 @@ class Mercurial(Repository):
             self.hg(["strip"] + self.strip_nodes)
             self.strip_nodes = []
 
-    def uncommitted(self):
-        return self.hg_out(["status", "--unknown", "-T", "{path}\n"], split=True)
+    def _status(self):
+        # `hg status` is slow on large repos.  As we'll need both uncommitted changes
+        # and untracked files separately, run it once and cache results.
+        if self.status is None:
+            self.status = dict(T=[], U=[])
+            for line in self.hg_out(
+                ["status", "--added", "--deleted", "--modified", "--unknown"],
+                split=True,
+            ):
+                status, path = line.split(" ", 1)
+                self.status["U" if status == "?" else "T"].append(path)
+        return self.status
+
+    def untracked(self):
+        return self._status()["U"]
 
     def _refresh_commit(self, commit, node, rev=None):
         """Update commit's node and name from node and rev."""
@@ -766,11 +791,9 @@ class Mercurial(Repository):
         )
 
     def check_commits_for_submit(self, commits):
-        nodes = [c["node"] for c in commits]
-
         # 'Greatest Common Ancestor'/'Merge Base' should be included in the revset.
         ancestor = self.hg_log("ancestor(%s)" % self.revset, split=False)
-        if ancestor not in nodes:
+        if ancestor not in [c["node"] for c in commits]:
             raise Error(
                 "Non-linear commit stack (common ancestor %s missing from stack)"
                 % ancestor[:12]
@@ -783,7 +806,7 @@ class Mercurial(Repository):
         for parent in parent_phases:
             (phase, node) = parent.split(" ", 1)
             if phase != "public":
-                raise Error(
+                logger.warning(
                     "%s is based off non-public commit %s" % (ancestor[:12], node[:12])
                 )
 
@@ -791,18 +814,26 @@ class Mercurial(Repository):
         if self.hg_log("%s and merge()" % self.revset):
             raise Error("Commit stack contains a merge commit")
 
-        for commit in commits:
-            # Follow each branch on the DAG ensuring only one has our nodes.
-            children = self.hg_log("children(%s)" % commit["node"])
-            found = False
-            for child in children:
-                descendants = self.hg_log(
-                    "descendants(%s) and %s" % (child, self.revset)
-                )
-                if len(descendants):
-                    if found:
-                        raise Error("Non-linear commit stack")
-                    found = True
+        # mq isn't currently supported.
+        if self.has_mq and self.hg_out(["qapplied"]):
+            raise Error("Found patches applied with `mq`, unable to continue")
+
+        # Uncommitted changes can interact poorly when we update to a different commit.
+        status = self._status()
+        if status["T"]:
+            err = [
+                "%s uncommitted change%s present"
+                % (len(status["T"]), " is" if len(status["T"]) == 1 else "s are")
+            ]
+            err.extend(
+                [
+                    "Commit changes, or use `hg shelve` to store uncommitted changes,",
+                    "restoring with `hg unshelve` after submission",
+                ]
+            )
+            if not self.has_shelve:
+                err.append("You can enable the shelve extension via `hg config --edit`")
+            raise Error("\n".join(err))
 
         super(Mercurial, self).check_commits_for_submit(commits)
 
@@ -1044,16 +1075,16 @@ def submit(repo, args):
             raise Error("Unable to submit commits:\n\n%s" % e)
         logger.error("Ignoring issues found with commits:\n\n%s" % e)
 
-    # Show a warning if there are uncommitted files.
-    if config.warn_uncommitted:
-        uncommitted = repo.uncommitted()
-        if uncommitted:
+    # Show a warning if there are untracked files.
+    if config.warn_untracked:
+        untracked = repo.untracked()
+        if untracked:
             logger.warning(
-                "Warning: found %s uncommitted file%s:"
-                % (len(uncommitted), "" if len(uncommitted) == 1 else "s")
+                "Warning: found %s untracked file%s:"
+                % (len(untracked), "" if len(untracked) == 1 else "s")
             )
-            if len(uncommitted) <= 5:
-                for filename in uncommitted:
+            if len(untracked) <= 5:
+                for filename in untracked:
                     logger.info("  %s" % filename)
 
     # Confirmation prompt.
