@@ -9,7 +9,7 @@
 
 ### Configuration
 
-`review` has an INI style configuration file to control defaults: `~/.review-config`
+`moz-phab` has an INI style configuration file to control defaults: `~/.moz-phab-config`
 
 This file will be created if it doesn't exist.
 

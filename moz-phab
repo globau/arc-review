@@ -264,8 +264,8 @@ class Error(Exception):
 
 class Config(object):
     def __init__(self):
-        self._filename = os.path.join(os.path.expanduser("~"), ".review-config")
-        self.name = "~/.review-config"  # human-readable name
+        self._filename = os.path.join(os.path.expanduser("~"), ".moz-phab-config")
+        self.name = "~/.moz-phab-config"  # human-readable name
 
         # Default values.
         defaults = u"""
