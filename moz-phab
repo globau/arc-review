@@ -72,7 +72,7 @@ GUIDE_URL = (
 )
 
 # Auto-update
-SELF_REPO = "globau/arc-review"
+SELF_REPO = "mozilla-conduit/review"
 SELF_UPDATE_FREQUENCY = 24 * 3  # hours
 ARC_UPDATE_FREQUENCY = 24 * 7  # hours
 
